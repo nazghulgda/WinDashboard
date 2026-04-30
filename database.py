@@ -164,29 +164,29 @@ def get_last_activity(task_id: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# TASK STAGES
+# TASK CHECKPOINTS
 # ---------------------------------------------------------------------------
 
-def get_stages(task_id: int) -> list:
-    """Returns stages of particular task in order."""
+def get_checkpoints(task_id: int) -> list:
+    """Returns checkpoints of particular task in order."""
     with get_connection() as conn:
         rows = conn.execute(
-            "SELECT * FROM task_stages WHERE task_id = ? ORDER BY stage_order",
+            "SELECT * FROM task_checkpoints WHERE task_id = ? ORDER BY checkpoint_order",
             (task_id,)
         ).fetchall()
     return [dict(r) for r in rows]
 
 
-def set_stage_completed(stage_id: int, completed: bool):
-    """Sets state of checkbox of stage and updates updated_at of task."""
+def set_checkpoint_completed(stage_id: int, completed: bool):
+    """Sets state of checkbox of checkpoint and updates updated_at of task."""
     with get_connection() as conn:
         conn.execute(
-            "UPDATE task_stages SET completed = ? WHERE id = ?",
-            (1 if completed else 0, stage_id)
+            "UPDATE task_checkpoints SET completed = ? WHERE id = ?",
+            (1 if completed else 0, checkpoint_id)
         )
         # Update updated_at of task for get_last_activity detection
         task_id = conn.execute(
-            "SELECT task_id FROM task_stages WHERE id = ?", (stage_id,)
+            "SELECT task_id FROM task_checkpoints WHERE id = ?", (checkpoint_id,)
         ).fetchone()[0]
         conn.execute(
             "UPDATE tasks SET updated_at = ? WHERE id = ?",
@@ -195,16 +195,16 @@ def set_stage_completed(stage_id: int, completed: bool):
 
 
 def set_iteration_count(stage_id: int, count: int):
-    """Sets stage iteration counter. count >= 0."""
+    """Sets checkpoint iteration counter. count >= 0."""
     count = max(0, count)
     completed = 1 if count > 0 else 0
     with get_connection() as conn:
         conn.execute(
-            "UPDATE task_stages SET iteration_count = ?, completed = ? WHERE id = ?",
-            (count, completed, stage_id)
+            "UPDATE task_checkpoints SET iteration_count = ?, completed = ? WHERE id = ?",
+            (count, completed, checkpoint_id)
         )
         task_id = conn.execute(
-            "SELECT task_id FROM task_stages WHERE id = ?", (stage_id,)
+            "SELECT task_id FROM task_checkpoints WHERE id = ?", (stage_id,)
         ).fetchone()[0]
         conn.execute(
             "UPDATE tasks SET updated_at = ? WHERE id = ?",
@@ -213,27 +213,27 @@ def set_iteration_count(stage_id: int, count: int):
 
 
 def get_task_progress(task_id: int) -> tuple[int, int]:
-    """Returns (finished, all) task stages."""
+    """Returns (finished, all) task checkpoints."""
     with get_connection() as conn:
         total = conn.execute(
-            "SELECT COUNT(*) FROM task_stages WHERE task_id = ?", (task_id,)
+            "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ?", (task_id,)
         ).fetchone()[0]
         done = conn.execute(
-            "SELECT COUNT(*) FROM task_stages WHERE task_id = ? AND completed = 1", (task_id,)
+            "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ? AND completed = 1", (task_id,)
         ).fetchone()[0]
     return done, total
 
 
-def get_task_stage_status(task_id: int) -> str:
-    """Returns actual status name from task based on STAGE_GROUPS."""
-    stages = get_stages(task_id)
-    completed_orders = {s["stage_order"] for s in stages if s["completed"]}
+def get_task_checkpoint_status(task_id: int) -> str:
+    """Returns actual status name from task based on CHECKPOINT_GROUPS."""
+    checkpoints = get_checkpoints(task_id)
+    completed_orders = {s["checkpoint_order"] for s in checkpoints if s["completed"]}
 
-    current_status = STAGE_GROUPS[0]["name"]  # "Not started"
-    for group in STAGE_GROUPS:
-        if not group["stages"]:
+    current_status = CHECKPOINT_GROUPS[0]["name"]  # "Not started"
+    for group in CEHCKPOINT_GROUPS:
+        if not group["checkpoints"]:
             continue
-        if all(order in completed_orders for order in group["stages"]):
+        if all(order in completed_orders for order in group["checkpoints"]):
             current_status = group["name"]
 
     return current_status
