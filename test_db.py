@@ -21,7 +21,7 @@ print(f"Task created, id={task_id}")
 # Checkpoints test
 checkpoints = get_checkpoints(task_id)
 print(f"Checkpoints created: {len(checkpoints)} (waiting: 20)")
-print(f"First: '{checkpoints[0]['name']}', Last: '{checkpoints[-1]['name'}'")
+print(f"  First: '{checkpoints[0]['name']}', Last: '{checkpoints[-1]['name']}'")
 
 # Marking of a few checkpints
 set_checkpoint_completed(checkpoints[0]["id"], True)
