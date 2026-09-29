@@ -13,14 +13,14 @@ ARCHIVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "archive"
 # type: "counter" = iteration counter (buttons + / -)
 CHECKPOINTS = [
   {"order": 1, "name": "Kick-off", "type": "check"},
-  {"order": 2, "name": "ChekPoint 1", "type": "check"},
-  {"order": 3, "name": "ChekPoint 2", "type": "check"},
-  {"order": 4, "name": "ChekPoint 3", "type": "check"},
-  {"order": 5, "name": "ChekPoint 4", "type": "check"},
-  {"order": 6, "name": "ChekPoint 5", "type": "counter"},
-  {"order": 7, "name": "ChekPoint 6", "type": "counter"},
-  {"order": 8, "name": "ChekPoint 7", "type": "check"},
-  {"order": 9, "name": "ChekPoint 8", "type": "check"},
+  {"order": 2, "name": "CheckPoint 1", "type": "check"},
+  {"order": 3, "name": "CheckPoint 2", "type": "check"},
+  {"order": 4, "name": "CheckPoint 3", "type": "check"},
+  {"order": 5, "name": "CheckPoint 4", "type": "check"},
+  {"order": 6, "name": "CheckPoint 5", "type": "counter"},
+  {"order": 7, "name": "CheckPoint 6", "type": "counter"},
+  {"order": 8, "name": "CheckPoint 7", "type": "check"},
+  {"order": 9, "name": "CheckPoint 8", "type": "check"},
   {"order": 10, "name": "Closed", "type": "check"},
 ]
 
@@ -38,7 +38,7 @@ STAGES = [
 ]
 
 # Main program window settings
-APP_TITLE = "Dashboard"
+APP_TITLE = "WinDashboard"
 MAIN_WINDOW_SIZE = "900x600"
 
 # Task status colours
