@@ -1,6 +1,6 @@
 DASHBOARD
 
-This "Dashboard" was created to work in "restricted environemnts", where software tooling is heavy limited (usually Windows + Office + Python). Python is mandatory for now.
+This "Dashboard" was created to work in "restricted environements", where software tooling is heavy limited (usually Windows + Office + Python). Python is mandatory for now.
 
 "DASHBOARD" includes:
 - tasks list
