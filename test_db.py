@@ -7,6 +7,7 @@ from database import (
     create_link, get_links,
     delete_task
 )
+from config import CHECKPOINTS
 
 print("=== Database structure test ===\n")
 
@@ -20,7 +21,7 @@ print(f"Task created, id={task_id}")
 
 # Checkpoints test
 checkpoints = get_checkpoints(task_id)
-print(f"Checkpoints created: {len(checkpoints)} (waiting: 20)")
+print(f"Checkpoints created: {len(checkpoints)} (waiting: {len(CHECKPOINTS)})")
 print(f"  First: '{checkpoints[0]['name']}', Last: '{checkpoints[-1]['name']}'")
 
 # Marking of a few checkpints

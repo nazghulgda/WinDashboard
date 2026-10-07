@@ -1,8 +1,11 @@
 /old/
 ./old/
 tasks.db
+tasks.db.bak
 dashboard-stages.md
 /venv/
 ./venv/
 .idea/
 __pycache__/
+archive/
+

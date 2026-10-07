@@ -1,4 +1,4 @@
-# main_window.py
+# main_window.pyw
 
 import os
 import tkinter as tk
@@ -7,9 +7,9 @@ from database import (
     init_db, backup_db,
     get_all_tasks, get_on_hold_tasks,
     create_task, set_on_hold, get_task_progress,
-    get_task_stage_status, get_last_activity
+    get_task_checkpoint_status, get_last_activity
 )
-from config import APP_TITLE, MAIN_WINDOW_SIZE, STATUS_COLORS, STAGES
+from config import APP_TITLE, MAIN_WINDOW_SIZE, STATUS_COLORS, CHECKPOINTS
 from archive import export_task_to_zip, import_task_from_zip, list_archive, remove_archived_task
 
 COLORS = {
@@ -98,9 +98,9 @@ class MainWindow:
             fg=COLORS["accent"], padx=20, pady=14
         ).pack(side="left")
 
-        self._make_button(header, "+ Nowy task",  lambda: self._new_task(),
+        self._make_button(header, "+ New task",  lambda: self._new_task(),
                           side="right", padx=20, pady=12)
-        self._make_button(header, "📦 Archiwum",  lambda: self._open_archive(),
+        self._make_button(header, "📦 Archive",  lambda: self._open_archive(),
                           side="right", padx=(0, 4), pady=12, secondary=True)
         self._make_button(header, "⏸ On Hold",    lambda: self._open_on_hold(),
                           side="right", padx=(0, 4), pady=12, secondary=True)
@@ -110,7 +110,7 @@ class MainWindow:
         filter_bar = tk.Frame(self.root, bg=COLORS["bg"], padx=16, pady=10)
         filter_bar.pack(fill="x")
 
-        tk.Label(filter_bar, text="Szukaj:", font=FONT_BODY,
+        tk.Label(filter_bar, text="Search:", font=FONT_BODY,
                  bg=COLORS["bg"], fg=COLORS["text_dim"]).pack(side="left")
 
         self.search_var = tk.StringVar()
@@ -122,7 +122,7 @@ class MainWindow:
         ).pack(side="left", padx=(6, 20), ipady=4)
 
         # Sorting
-        tk.Label(filter_bar, text="Sortuj:", font=FONT_BODY,
+        tk.Label(filter_bar, text="Sort by:", font=FONT_BODY,
                  bg=COLORS["bg"], fg=COLORS["text_dim"]).pack(side="left")
 
         self.sort_var = tk.StringVar(value="last_activity")
@@ -205,7 +205,7 @@ class MainWindow:
         for w in self.cards_frame.winfo_children():
             w.destroy()
 
-        self.count_label.config(text=f"{len(tasks)} task{'ów' if len(tasks) != 1 else ''}")
+        self.count_label.config(text=f"{len(tasks)} task{'s' if len(tasks) != 1 else ''}")
 
         if not tasks:
             tk.Label(
@@ -262,8 +262,8 @@ class MainWindow:
         bottom_row = tk.Frame(info, bg=COLORS["card"])
         bottom_row.pack(fill="x", pady=(2, 0))
 
-        stage_status = get_task_stage_status(task["id"])
-        tk.Label(bottom_row, text=stage_status,
+        checkpoint_status = get_task_checkpoint_status(task["id"])
+        tk.Label(bottom_row, text=checkpoint_status,
                  font=("Segoe UI", 8, "bold"), bg=COLORS["card"],
                  fg=COLORS["accent2"], anchor="w").pack(side="left")
 
@@ -313,8 +313,8 @@ class MainWindow:
         dialog = NewTaskDialog(self.root)
         self.root.wait_window(dialog.window)
         if dialog.result:
-            stages = None if dialog.result.get("use_template") else []
-            create_task(dialog.result["title"], dialog.result["description"], stages=stages)
+            checkpoints = None if dialog.result.get("use_template") else []
+            create_task(dialog.result["title"], dialog.result["description"], checkpoints=checkpoints)
             self._load_tasks()
 
     def _open_task(self, task_id: int):
@@ -384,7 +384,7 @@ class MainWindow:
             return False
 
     # -----------------------------------------------------------------------
-    # Helpery UI
+    # UI helpers
     # -----------------------------------------------------------------------
 
     def _make_button(self, parent, text, command,
@@ -478,7 +478,7 @@ class NewTaskDialog:
             selectcolor=COLORS["card"], font=FONT_BODY
         )
         tk.Radiobutton(
-            tmpl_frame, text=f"Use Default Template  ({len(STAGES)} Stages)",
+            tmpl_frame, text=f"Use Default Template  ({len(CHECKPOINTS)} Checkpoints)",
             variable=self.template_var, value="template", **radio_style
         ).pack(anchor="w")
         tk.Radiobutton(
@@ -512,7 +512,7 @@ class NewTaskDialog:
 
 
 # ---------------------------------------------------------------------------
-# Okno: On Hold
+# Window: On Hold
 # ---------------------------------------------------------------------------
 
 class OnHoldWindow:
@@ -584,7 +584,7 @@ class OnHoldWindow:
         tk.Label(row1, text=f"on hold: {hold_date}", font=FONT_SMALL,
                  bg=COLORS["card"], fg=COLORS["text_dim"]).pack(side="right")
 
-        tk.Label(info, text=f"{done} from {total} stages completed", font=FONT_SMALL,
+        tk.Label(info, text=f"{done} from {total} checkpoints completed", font=FONT_SMALL,
                  bg=COLORS["card"], fg=COLORS["text_dim"], anchor="w").pack(anchor="w", pady=(2, 0))
 
         actions = tk.Frame(card, bg=COLORS["card"])
@@ -632,7 +632,7 @@ class OnHoldWindow:
 
 
 # ---------------------------------------------------------------------------
-# Okno: Archive
+# Window: Archive
 # ---------------------------------------------------------------------------
 
 class ArchiveWindow:
@@ -716,13 +716,13 @@ class ArchiveWindow:
         row1.pack(fill="x")
         tk.Label(row1, text=a["title"], font=("Segoe UI", 11, "bold"),
                  bg=COLORS["card"], fg=COLORS["text"], anchor="w").pack(side="left")
-        tk.Label(row1, text=f"arch: {a['export_date']}", font=FONT_SMALL,
+        tk.Label(row1, text=f"archived: {a['export_date']}", font=FONT_SMALL,
                  bg=COLORS["card"], fg=COLORS["text_dim"]).pack(side="right")
 
         row2 = tk.Frame(info, bg=COLORS["card"])
         row2.pack(fill="x")
         tk.Label(row2,
-                 text=f"Postęp: {a['progress']}  |  utworzony: {a['created_at']}",
+                 text=f"Progress: {a['progress']}  |  created: {a['created_at']}",
                  font=FONT_SMALL, bg=COLORS["card"], fg=COLORS["text_dim"],
                  anchor="w").pack(side="left")
 
@@ -746,7 +746,7 @@ class ArchiveWindow:
         del_btn.bind("<Leave>", lambda e: del_btn.config(bg="#3a1515"))
 
     def _restore(self, zip_path: str, filename: str):
-        source_label = "On Hold" if "onhold" in filename else "aktywnych"
+        source_label = "On Hold" if "onhold" in filename else "Active"
         if not messagebox.askyesno(
             "Restore Task",
             f"Restore task to the {source_label} list?\n\n{filename}",

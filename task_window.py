@@ -8,12 +8,12 @@ import re
 from datetime import datetime
 
 from database import (
-    get_task, get_stages, set_stage_completed, set_iteration_count,
-    get_task_progress, get_task_stage_status,
+    get_task, get_checkpoints, set_checkpoint_completed, set_iteration_count,
+    get_task_progress, get_task_checkpoint_status,
     get_notes, create_note, update_note,
     get_links, create_link, update_link, delete_link,
     update_task,
-    add_stage, delete_stage, update_stage, move_stage,
+    add_checkpoint, delete_checkpoint, update_checkpoint, move_checkpoint,
 )
 
 # ---------------------------------------------------------------------------
@@ -38,8 +38,8 @@ COLORS = {
     "border":       "#1e3a5f",
     "check_on":     "#e94560",
     "check_off":    "#0a1628",
-    "stage_done":   "#1a3a1a",
-    "stage_undone": "#0f3460",
+    "checkpoint_done":   "#1a3a1a",
+    "checkpoint_undone": "#0f3460",
 }
 
 FONT_TITLE   = ("Segoe UI", 16, "bold")
@@ -79,7 +79,7 @@ class TaskWindow:
             self.window.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._open_note_windows = {}
-        self._stages_canvas = None  # reference to kanban canvas
+        self._checkpoints_canvas = None  # reference to kanban canvas
         self._build_ui()
         self._load_all()
         
@@ -149,7 +149,7 @@ class TaskWindow:
 
         hdr = tk.Frame(parent, bg=COLORS["panel"])
         hdr.grid(row=0, column=0, sticky="ew")
-        tk.Label(hdr, text="ETAPY", font=FONT_HEADING,
+        tk.Label(hdr, text="CHECKPOINTS", font=FONT_HEADING,
                  bg=COLORS["panel"], fg=COLORS["accent"],
                  padx=12, pady=8).pack(side="left")
         self.progress_label = tk.Label(
@@ -169,88 +169,88 @@ class TaskWindow:
         sb.grid(row=0, column=1, sticky="ns")
         canvas.grid(row=0, column=0, sticky="nsew")
 
-        self._stages_canvas = canvas  # reference saved
+        self._checkpoints_canvas = canvas  # reference saved
 
-        self.stages_inner = tk.Frame(canvas, bg=COLORS["bg"])
-        win_id = canvas.create_window((0, 0), window=self.stages_inner, anchor="nw")
+        self.checkpoints_inner = tk.Frame(canvas, bg=COLORS["bg"])
+        win_id = canvas.create_window((0, 0), window=self.checkpoints_inner, anchor="nw")
 
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(win_id, width=e.width))
-        self.stages_inner.bind("<Configure>",
+        self.checkpoints_inner.bind("<Configure>",
             lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         _setup_mousewheel_scroll(canvas)
 
     def _load_kanban(self):
-        for w in self.stages_inner.winfo_children():
+        for w in self.checkpoints_inner.winfo_children():
             w.destroy()
 
-        stages = get_stages(self.task_id)
-        stages_count = len(stages)
-        status = get_task_stage_status(self.task_id)
+        checkpoints = get_checkpoints(self.task_id)
+        checkpoints_count = len(checkpoints)
+        status = get_task_checkpoint_status(self.task_id)
         self.progress_label.config(text=status)
 
-        self._stage_vars = {}
+        self._checkpoint_vars = {}
 
-        if not stages:
+        if not checkpoints:
             tk.Label(
-                self.stages_inner,
-                text="Kanban is empty.\nAdd first stage below.",
+                self.checkpoints_inner,
+                text="Kanban is empty.\nAdd first checkpoint below.",
                 font=FONT_SMALL, bg=COLORS["bg"], fg=COLORS["text_dim"],
                 pady=16, justify="center"
             ).pack()
         else:
-            for stage in stages:
-                is_done = bool(stage["completed"])
-                bg = COLORS["stage_done"] if is_done else COLORS["stage_undone"]
-                row = tk.Frame(self.stages_inner, bg=bg, pady=6, padx=10)
+            for checkpoint in checkpoints:
+                is_done = bool(checkpoint["completed"])
+                bg = COLORS["checkpoint_done"] if is_done else COLORS["checkpoint_undone"]
+                row = tk.Frame(self.checkpoints_inner, bg=bg, pady=6, padx=10)
                 row.pack(fill="x", pady=2)
 
-                if stage.get("stage_type", "check") == "counter":
-                    self._make_counter_row(row, stage, stages_count)
+                if checkpoint.get("checkpoint_type", "check") == "counter":
+                    self._make_counter_row(row, checkpoint, checkpoints_count)
                 else:
-                    self._make_check_row(row, stage, stages_count)
+                    self._make_check_row(row, checkpoint, checkpoints_count)
 
-        # Stage addition button
-        add_frame = tk.Frame(self.stages_inner, bg=COLORS["bg"], pady=4)
+        # Checkpoint addition button
+        add_frame = tk.Frame(self.checkpoints_inner, bg=COLORS["bg"], pady=4)
         add_frame.pack(fill="x", pady=(6, 0))
         add_btn = tk.Label(
-            add_frame, text="+ Add Stage", font=FONT_SMALL,
+            add_frame, text="+ Add Checkpoint", font=FONT_SMALL,
             bg=COLORS["btn_secondary"], fg=COLORS["text_dim"],
             padx=12, pady=5, cursor="hand2"
         )
         add_btn.pack(side="left", padx=10)
-        add_btn.bind("<Button-1>", lambda e: self._add_stage())
+        add_btn.bind("<Button-1>", lambda e: self._add_checkpoint())
         add_btn.bind("<Enter>",
             lambda e: add_btn.config(bg=COLORS["card_hover"], fg=COLORS["text"]))
         add_btn.bind("<Leave>",
             lambda e: add_btn.config(bg=COLORS["btn_secondary"], fg=COLORS["text_dim"]))
 
-    def _make_check_row(self, row: tk.Frame, stage: dict, stages_count: int):
-        is_done = bool(stage["completed"])
-        bg = COLORS["stage_done"] if is_done else COLORS["stage_undone"]
-        order = stage["stage_order"]
+    def _make_check_row(self, row: tk.Frame, checkpoint: dict, checkpoints_count: int):
+        is_done = bool(checkpoint["completed"])
+        bg = COLORS["checkpoint_done"] if is_done else COLORS["checkpoint_undone"]
+        order = checkpoint["checkpoint_order"]
 
         var = tk.BooleanVar(value=is_done)
-        self._stage_vars[stage["id"]] = var
+        self._checkpoint_vars[checkpoint["id"]] = var
 
         cb = tk.Checkbutton(
             row, variable=var,
             bg=bg, activebackground=COLORS["card_hover"],
             selectcolor=COLORS["check_on"], fg=COLORS["text"],
-            command=lambda sid=stage["id"], v=var: self._toggle_stage(sid, v)
+            command=lambda sid=checkpoint["id"], v=var: self._toggle_checkpoint(sid, v)
         )
         cb.pack(side="left")
 
         tk.Label(
-            row, text=stage["name"], font=FONT_BODY, bg=bg,
+            row, text=checkpoint["name"], font=FONT_BODY, bg=bg,
             fg=COLORS["text"] if is_done else COLORS["text_dim"]
         ).pack(side="left", padx=(4, 0))
 
-        self._pack_stage_controls(row, stage, stages_count, bg)
+        self._pack_checkpoint_controls(row, checkpoint, checkpoints_count, bg)
 
-    def _make_counter_row(self, row: tk.Frame, stage: dict, stages_count: int):
-        count = stage.get("iteration_count", 0)
+    def _make_counter_row(self, row: tk.Frame, checkpoint: dict, checkpoints_count: int):
+        count = checkpoint.get("iteration_count", 0)
         is_done = count > 0
-        bg = COLORS["stage_done"] if is_done else COLORS["stage_undone"]
+        bg = COLORS["checkpoint_done"] if is_done else COLORS["checkpoint_undone"]
 
         minus = tk.Label(
             row, text=" − ", font=FONT_BODY,
@@ -274,16 +274,16 @@ class TaskWindow:
         plus.pack(side="left")
 
         tk.Label(
-            row, text=f"  {stage['name']}  (optional, repeatable)",
+            row, text=f"  {checkpoint['name']}  (optional, repeatable)",
             font=FONT_BODY, bg=bg,
             fg=COLORS["text"] if is_done else COLORS["text_dim"]
         ).pack(side="left", padx=(6, 0))
 
-        self._pack_stage_controls(row, stage, stages_count, bg)
+        self._pack_checkpoint_controls(row, checkpoint, checkpoints_count, bg)
 
-        def change(delta, sid=stage["id"]):
-            current_stages = get_stages(self.task_id)
-            current = next((s["iteration_count"] for s in current_stages if s["id"] == sid), 0)
+        def change(delta, sid=checkpoint["id"]):
+            current_checkpoints = get_checkpoints(self.task_id)
+            current = next((s["iteration_count"] for s in current_checkpoints if s["id"] == sid), 0)
             new_count = max(0, current + delta)
             set_iteration_count(sid, new_count)
             self._reload_kanban_keep_scroll()
@@ -295,9 +295,9 @@ class TaskWindow:
         plus.bind("<Enter>",  lambda e: plus.config(bg=COLORS["btn_hover"]))
         plus.bind("<Leave>",  lambda e: plus.config(bg=COLORS["btn"]))
 
-    def _pack_stage_controls(self, row: tk.Frame, stage: dict, stages_count: int, bg: str):
-        """Adds control buttons (up/down/edit) to the right side of the stage row."""
-        order = stage["stage_order"]
+    def _pack_checkpoint_controls(self, row: tk.Frame, checkpoint: dict, checkpoints_count: int, bg: str):
+        """Adds control buttons (up/down/edit) to the right side of the checkpoint row."""
+        order = checkpoint["checkpoint_order"]
 
         ctrl = tk.Frame(row, bg=bg)
         ctrl.pack(side="right")
@@ -308,12 +308,12 @@ class TaskWindow:
             fg=COLORS["text_dim"], padx=6, cursor="hand2"
         )
         edit_btn.pack(side="right")
-        edit_btn.bind("<Button-1>", lambda e, s=dict(stage): self._edit_stage(s))
+        edit_btn.bind("<Button-1>", lambda e, s=dict(checkpoint): self._edit_checkpoint(s))
         edit_btn.bind("<Enter>", lambda e: edit_btn.config(fg=COLORS["accent"]))
         edit_btn.bind("<Leave>", lambda e: edit_btn.config(fg=COLORS["text_dim"]))
 
         # Down button
-        can_down = order < stages_count
+        can_down = order < checkpoints_count
         down_btn = tk.Label(
             ctrl, text="▼", font=("Segoe UI", 7), bg=bg,
             fg=COLORS["text_dim"] if can_down else bg,
@@ -322,7 +322,7 @@ class TaskWindow:
         down_btn.pack(side="right")
         if can_down:
             down_btn.bind("<Button-1>",
-                lambda e, sid=stage["id"]: self._move_stage(sid, "down"))
+                lambda e, sid=checkpoint["id"]: self._move_checkpoint(sid, "down"))
             down_btn.bind("<Enter>", lambda e: down_btn.config(fg=COLORS["text"]))
             down_btn.bind("<Leave>", lambda e: down_btn.config(fg=COLORS["text_dim"]))
 
@@ -336,7 +336,7 @@ class TaskWindow:
         up_btn.pack(side="right")
         if can_up:
             up_btn.bind("<Button-1>",
-                lambda e, sid=stage["id"]: self._move_stage(sid, "up"))
+                lambda e, sid=checkpoint["id"]: self._move_checkpoint(sid, "up"))
             up_btn.bind("<Enter>", lambda e: up_btn.config(fg=COLORS["text"]))
             up_btn.bind("<Leave>", lambda e: up_btn.config(fg=COLORS["text_dim"]))
 
@@ -346,44 +346,44 @@ class TaskWindow:
 
     def _reload_kanban_keep_scroll(self):
         """Reloads the kanban board while keeping the scroll position."""
-        yview = self._stages_canvas.yview() if self._stages_canvas else (0.0, 1.0)
+        yview = self._checkpoints_canvas.yview() if self._checkpoints_canvas else (0.0, 1.0)
         self._load_kanban()
-        if self._stages_canvas and yview[0] > 0:
-            self._stages_canvas.after(10,
-                lambda y=yview[0]: self._stages_canvas.yview_moveto(y))
+        if self._checkpoints_canvas and yview[0] > 0:
+            self._checkpoints_canvas.after(10,
+                lambda y=yview[0]: self._checkpoints_canvas.yview_moveto(y))
 
-    def _toggle_stage(self, stage_id: int, var: tk.BooleanVar):
-        set_stage_completed(stage_id, var.get())
+    def _toggle_checkpoint(self, checkpoint_id: int, var: tk.BooleanVar):
+        set_checkpoint_completed(checkpoint_id, var.get())
         self._reload_kanban_keep_scroll()
 
-    def _move_stage(self, stage_id: int, direction: str):
-        yview = self._stages_canvas.yview() if self._stages_canvas else (0.0, 1.0)
-        move_stage(self.task_id, stage_id, direction)
+    def _move_checkpoint(self, checkpoint_id: int, direction: str):
+        yview = self._checkpoints_canvas.yview() if self._checkpoints_canvas else (0.0, 1.0)
+        move_checkpoint(self.task_id, checkpoint_id, direction)
         self._load_kanban()
-        if self._stages_canvas and yview[0] > 0:
-            self._stages_canvas.after(10,
-                lambda y=yview[0]: self._stages_canvas.yview_moveto(y))
+        if self._checkpoints_canvas and yview[0] > 0:
+            self._checkpoints_canvas.after(10,
+                lambda y=yview[0]: self._checkpoints_canvas.yview_moveto(y))
 
-    def _edit_stage(self, stage: dict):
-        dialog = StageEditDialog(self.window, stage)
+    def _edit_checkpoint(self, checkpoint: dict):
+        dialog = CheckpointEditDialog(self.window, checkpoint)
         self.window.wait_window(dialog.window)
         if dialog.result == "deleted":
-            delete_stage(stage["id"])
+            delete_checkpoint(checkpoint["id"])
             self._load_kanban()
         elif dialog.result:
-            update_stage(stage["id"], dialog.result["name"], dialog.result["stage_type"])
+            update_checkpoint(checkpoint["id"], dialog.result["name"], dialog.result["checkpoint_type"])
             self._reload_kanban_keep_scroll()
 
-    def _add_stage(self):
-        dialog = AddStageDialog(self.window)
+    def _add_checkpoint(self):
+        dialog = AddCheckpointDialog(self.window)
         self.window.wait_window(dialog.window)
         if dialog.result:
-            add_stage(self.task_id, dialog.result["name"], dialog.result["stage_type"])
+            add_checkpoint(self.task_id, dialog.result["name"], dialog.result["checkpoint_type"])
             self._load_kanban()
-            # Przewin na dol zeby pokazac nowy etap
-            if self._stages_canvas:
-                self._stages_canvas.after(50,
-                    lambda: self._stages_canvas.yview_moveto(1.0))
+            # Scroll down to show the new checkpoint
+            if self._checkpoints_canvas:
+                self._checkpoints_canvas.after(50,
+                    lambda: self._checkpoints_canvas.yview_moveto(1.0))
 
     # -----------------------------------------------------------------------
     # Panel: Notes
@@ -400,7 +400,7 @@ class TaskWindow:
                  padx=12, pady=8).pack(side="left")
 
         add_btn = tk.Label(
-            hdr, text="+ Nowa", font=FONT_SMALL,
+            hdr, text="+ New", font=FONT_SMALL,
             bg=COLORS["btn"], fg="white",
             padx=8, pady=4, cursor="hand2"
         )
@@ -696,22 +696,22 @@ class TaskWindow:
 
 
 # ---------------------------------------------------------------------------
-# StageEditDialog: Edit Stage (change name, type, delete)
+# CheckpointEditDialog: Edit Checkpoint (change name, type, delete)
 # ---------------------------------------------------------------------------
 
-class StageEditDialog:
-    def __init__(self, parent, stage: dict):
-        self.stage  = stage
-        self.result = None  # None=anulowano, "deleted"=usunięto, dict=zapisano
+class CheckpointEditDialog:
+    def __init__(self, parent, checkpoint: dict):
+        self.checkpoint  = checkpoint
+        self.result = None  # None=cancelled, "deleted"=deleted, dict=saved
 
         self.window = tk.Toplevel(parent)
-        self.window.title("Edit Stage")
+        self.window.title("Edit Checkpoint")
         self.window.configure(bg=COLORS["bg"])
         self.window.geometry("420x250")
         self.window.resizable(False, False)
         self.window.grab_set()
 
-        tk.Label(self.window, text="Edit Stage", font=FONT_HEADING,
+        tk.Label(self.window, text="Edit Checkpoint", font=FONT_HEADING,
                  bg=COLORS["bg"], fg=COLORS["accent"],
                  pady=12, padx=20).pack(anchor="w")
         tk.Frame(self.window, bg=COLORS["accent"], height=1).pack(fill="x")
@@ -719,9 +719,9 @@ class StageEditDialog:
         form = tk.Frame(self.window, bg=COLORS["bg"], padx=20, pady=14)
         form.pack(fill="both", expand=True)
 
-        tk.Label(form, text="Stage Name", font=FONT_BODY,
+        tk.Label(form, text="Checkpoint Name", font=FONT_BODY,
                  bg=COLORS["bg"], fg=COLORS["text"]).pack(anchor="w")
-        self.name_var = tk.StringVar(value=stage["name"])
+        self.name_var = tk.StringVar(value=checkpoint["name"])
         entry = tk.Entry(form, textvariable=self.name_var, font=FONT_BODY,
                          bg=COLORS["card"], fg=COLORS["text"],
                          insertbackground=COLORS["text"], relief="flat")
@@ -729,9 +729,9 @@ class StageEditDialog:
         entry.focus_set()
         entry.select_range(0, "end")
 
-        tk.Label(form, text="Stage Type", font=FONT_BODY,
+        tk.Label(form, text="Checkpoint Type", font=FONT_BODY,
                  bg=COLORS["bg"], fg=COLORS["text"]).pack(anchor="w")
-        self.type_var = tk.StringVar(value=stage.get("stage_type", "check"))
+        self.type_var = tk.StringVar(value=checkpoint.get("checkpoint_type", "check"))
         type_row = tk.Frame(form, bg=COLORS["bg"])
         type_row.pack(anchor="w", pady=(2, 14))
         radio_style = dict(
@@ -750,7 +750,7 @@ class StageEditDialog:
         btn_row.pack(fill="x")
 
         # Delete button (left)
-        del_btn = tk.Label(btn_row, text="🗑 Delete Stage", font=FONT_BODY,
+        del_btn = tk.Label(btn_row, text="🗑 Delete Checkpoint", font=FONT_BODY,
                            bg="#5a1515", fg="#ff9999",
                            padx=10, pady=6, cursor="hand2")
         del_btn.pack(side="left")
@@ -780,14 +780,14 @@ class StageEditDialog:
         name = self.name_var.get().strip()
         if not name:
             return
-        self.result = {"name": name, "stage_type": self.type_var.get()}
+        self.result = {"name": name, "checkpoint_type": self.type_var.get()}
         self.window.destroy()
 
     def _delete(self):
         if messagebox.askyesno(
-            "Delete Stage",
-            f"Are you sure you want to delete the stage:\n\n\"{self.stage['name']}\"?\n\n"
-            "Remaining stages will be automatically renumbered.",
+            "Delete Checkpoint",
+            f"Are you sure you want to delete the checkpoint:\n\n\"{self.checkpoint['name']}\"?\n\n"
+            "Remaining checkpoints will be automatically renumbered.",
             parent=self.window
         ):
             self.result = "deleted"
@@ -795,21 +795,21 @@ class StageEditDialog:
 
 
 # ---------------------------------------------------------------------------
-# Dialog: Add Stage
+# Dialog: Add Checkpoint
 # ---------------------------------------------------------------------------
 
-class AddStageDialog:
+class AddCheckpointDialog:
     def __init__(self, parent):
         self.result = None
 
         self.window = tk.Toplevel(parent)
-        self.window.title("Add Stage")
+        self.window.title("Add Checkpoint")
         self.window.configure(bg=COLORS["bg"])
         self.window.geometry("420x220")
         self.window.resizable(False, False)
         self.window.grab_set()
 
-        tk.Label(self.window, text="Add Stage", font=FONT_HEADING,
+        tk.Label(self.window, text="Add Checkpoint", font=FONT_HEADING,
                  bg=COLORS["bg"], fg=COLORS["accent"],
                  pady=12, padx=20).pack(anchor="w")
         tk.Frame(self.window, bg=COLORS["accent"], height=1).pack(fill="x")
@@ -817,7 +817,7 @@ class AddStageDialog:
         form = tk.Frame(self.window, bg=COLORS["bg"], padx=20, pady=14)
         form.pack(fill="both", expand=True)
 
-        tk.Label(form, text="Stage Name", font=FONT_BODY,
+        tk.Label(form, text="Checkpoint Name", font=FONT_BODY,
                  bg=COLORS["bg"], fg=COLORS["text"]).pack(anchor="w")
         self.name_var = tk.StringVar()
         entry = tk.Entry(form, textvariable=self.name_var, font=FONT_BODY,
@@ -826,7 +826,7 @@ class AddStageDialog:
         entry.pack(fill="x", ipady=5, pady=(2, 12))
         entry.focus_set()
 
-        tk.Label(form, text="Stage Type", font=FONT_BODY,
+        tk.Label(form, text="Checkpoint Type", font=FONT_BODY,
                  bg=COLORS["bg"], fg=COLORS["text"]).pack(anchor="w")
         self.type_var = tk.StringVar(value="check")
         type_row = tk.Frame(form, bg=COLORS["bg"])
@@ -867,7 +867,7 @@ class AddStageDialog:
         name = self.name_var.get().strip()
         if not name:
             return
-        self.result = {"name": name, "stage_type": self.type_var.get()}
+        self.result = {"name": name, "checkpoint_type": self.type_var.get()}
         self.window.destroy()
 
 
@@ -1184,7 +1184,7 @@ class NoteEditorWindow:
 
         tk.Label(
             self.toolbar,
-            text="**pogrubienie**  *kursywa*  ~~przekreślenie~~",
+            text="**bold**  *italic*  ~~strikethrough~~",
             font=FONT_SMALL, bg=COLORS["panel"], fg=COLORS["text_dim"],
             padx=8
         ).pack(side="left")
@@ -1332,7 +1332,7 @@ class NoteEditorWindow:
             self.editor_text.delete(sel_start, sel_end)
             self.editor_text.insert(sel_start, f"{marker_open}{selected}{marker_close}")
         except tk.TclError:
-            self.editor_text.insert("insert", f"{marker_open}tekst{marker_close}")
+            self.editor_text.insert("insert", f"{marker_open}text{marker_close}")
 
     def _fmt_bold(self):    self._wrap_selection("**")
     def _fmt_italic(self):  self._wrap_selection("*")

@@ -1,8 +1,10 @@
 # database.py — database structure and CRUD functions
 
+import os
+import shutil
 import sqlite3
 from datetime import datetime
-from config import DB_PATH, STAGES, STAGE_GROUPS
+from config import DB_PATH, CHECKPOINTS, CHECKPOINT_GROUPS
 
 
 # ---------------------------------------------------------------------------
@@ -23,6 +25,7 @@ def get_connection():
 def init_db():
     """Creates tables in not exists. Migrates for existing databases."""
     with get_connection() as conn:
+        _migrate_legacy_stage_names(conn)
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS tasks (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,12 +37,12 @@ def init_db():
                 updated_at  TEXT    NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS task_stages (
+            CREATE TABLE IF NOT EXISTS task_checkpoints (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 task_id         INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-                stage_order     INTEGER NOT NULL,
+                checkpoint_order INTEGER NOT NULL,
                 name            TEXT    NOT NULL,
-                stage_type      TEXT    NOT NULL DEFAULT 'check',
+                checkpoint_type TEXT    NOT NULL DEFAULT 'check',
                 completed       INTEGER NOT NULL DEFAULT 0,
                 iteration_count INTEGER NOT NULL DEFAULT 0
             );
@@ -63,11 +66,11 @@ def init_db():
         """)
 
         # Migration for existing databases
-        stages_cols = [r[1] for r in conn.execute("PRAGMA table_info(task_stages)").fetchall()]
-        if "stage_type" not in stages_cols:
-            conn.execute("ALTER TABLE task_stages ADD COLUMN stage_type TEXT NOT NULL DEFAULT 'check'")
-        if "iteration_count" not in stages_cols:
-            conn.execute("ALTER TABLE task_stages ADD COLUMN iteration_count INTEGER NOT NULL DEFAULT 0")
+        cp_cols = [r[1] for r in conn.execute("PRAGMA table_info(task_checkpoints)").fetchall()]
+        if "checkpoint_type" not in cp_cols:
+            conn.execute("ALTER TABLE task_checkpoints ADD COLUMN checkpoint_type TEXT NOT NULL DEFAULT 'check'")
+        if "iteration_count" not in cp_cols:
+            conn.execute("ALTER TABLE task_checkpoints ADD COLUMN iteration_count INTEGER NOT NULL DEFAULT 0")
 
         tasks_cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
         if "on_hold" not in tasks_cols:
@@ -76,12 +79,36 @@ def init_db():
             conn.execute("ALTER TABLE tasks ADD COLUMN on_hold_at TEXT")
 
 
+def _migrate_legacy_stage_names(conn):
+    """Backward compatibility: renames the old 'task_stages' table and its
+    'stage_order' / 'stage_type' columns to the checkpoint naming.
+    Does nothing for a new database or one that is already migrated."""
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+    if "task_stages" in tables and "task_checkpoints" not in tables:
+        conn.execute("ALTER TABLE task_stages RENAME TO task_checkpoints")
+        tables.add("task_checkpoints")
+    if "task_checkpoints" not in tables:
+        return
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(task_checkpoints)").fetchall()]
+    if "stage_order" in cols and "checkpoint_order" not in cols:
+        conn.execute("ALTER TABLE task_checkpoints RENAME COLUMN stage_order TO checkpoint_order")
+    if "stage_type" in cols and "checkpoint_type" not in cols:
+        conn.execute("ALTER TABLE task_checkpoints RENAME COLUMN stage_type TO checkpoint_type")
+
+
 # ---------------------------------------------------------------------------
 # TASKS
 # ---------------------------------------------------------------------------
 
-def create_task(title: str, description: str = "") -> int:
-    """Creates new task with stages from config.STAGES."""
+def create_task(title: str, description: str = "", checkpoints: list = None) -> int:
+    """Creates new task.
+    checkpoints=None  -> default checkpoints from config.CHECKPOINTS
+    checkpoints=[]    -> empty kanban (no checkpoints)
+    checkpoints=[...] -> given list of checkpoints in config.CHECKPOINTS format
+    """
+    checkpoints_to_use = CHECKPOINTS if checkpoints is None else checkpoints
+
     now = datetime.now().isoformat()
     with get_connection() as conn:
         cur = conn.execute(
@@ -89,12 +116,13 @@ def create_task(title: str, description: str = "") -> int:
             (title, description, now, now)
         )
         task_id = cur.lastrowid
-        conn.executemany(
-            """INSERT INTO task_stages
-               (task_id, stage_order, name, stage_type, completed, iteration_count)
-               VALUES (?, ?, ?, ?, 0, 0)""",
-            [(task_id, s["order"], s["name"], s.get("type", "check")) for s in STAGES]
-        )
+        if checkpoints_to_use:
+            conn.executemany(
+                """INSERT INTO task_checkpoints
+                   (task_id, checkpoint_order, name, checkpoint_type, completed, iteration_count)
+                   VALUES (?, ?, ?, ?, 0, 0)""",
+                [(task_id, c["order"], c["name"], c.get("type", "check")) for c in checkpoints_to_use]
+            )
     return task_id
 
 
@@ -146,7 +174,7 @@ def set_on_hold(task_id: int, on_hold: bool):
 
 
 def get_last_activity(task_id: int) -> str:
-    """Returns last activity date in task (task + stages + notes + links)."""
+    """Returns last activity date in task (task + checkpoints + notes)."""
     with get_connection() as conn:
         task_upd = conn.execute(
             "SELECT updated_at FROM tasks WHERE id = ?", (task_id,)
@@ -154,13 +182,27 @@ def get_last_activity(task_id: int) -> str:
         note_upd = conn.execute(
             "SELECT MAX(updated_at) FROM task_notes WHERE task_id = ?", (task_id,)
         ).fetchone()
-        # Stages does not have updated_at — used updated_at from task (updated with toggle)
+        # Checkpoints do not have updated_at — used updated_at from task (updated with toggle)
         dates = [
             task_upd[0] if task_upd else None,
             note_upd[0] if note_upd else None,
         ]
         dates = [d for d in dates if d]
     return max(dates) if dates else ""
+
+
+def backup_db():
+    """Creates a backup copy of the database (tasks.db.bak).
+    Replaces the previous copy. Silent on error."""
+    if not os.path.exists(DB_PATH):
+        return
+    backup_path = DB_PATH + ".bak"
+    try:
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+        shutil.copy2(DB_PATH, backup_path)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +219,7 @@ def get_checkpoints(task_id: int) -> list:
     return [dict(r) for r in rows]
 
 
-def set_checkpoint_completed(stage_id: int, completed: bool):
+def set_checkpoint_completed(checkpoint_id: int, completed: bool):
     """Sets state of checkbox of checkpoint and updates updated_at of task."""
     with get_connection() as conn:
         conn.execute(
@@ -194,7 +236,7 @@ def set_checkpoint_completed(stage_id: int, completed: bool):
         )
 
 
-def set_iteration_count(stage_id: int, count: int):
+def set_iteration_count(checkpoint_id: int, count: int):
     """Sets checkpoint iteration counter. count >= 0."""
     count = max(0, count)
     completed = 1 if count > 0 else 0
@@ -204,7 +246,7 @@ def set_iteration_count(stage_id: int, count: int):
             (count, completed, checkpoint_id)
         )
         task_id = conn.execute(
-            "SELECT task_id FROM task_checkpoints WHERE id = ?", (stage_id,)
+            "SELECT task_id FROM task_checkpoints WHERE id = ?", (checkpoint_id,)
         ).fetchone()[0]
         conn.execute(
             "UPDATE tasks SET updated_at = ? WHERE id = ?",
@@ -225,18 +267,108 @@ def get_task_progress(task_id: int) -> tuple[int, int]:
 
 
 def get_task_checkpoint_status(task_id: int) -> str:
-    """Returns actual status name from task based on CHECKPOINT_GROUPS."""
+    """Returns actual status name of task based on CHECKPOINT_GROUPS."""
     checkpoints = get_checkpoints(task_id)
-    completed_orders = {s["checkpoint_order"] for s in checkpoints if s["completed"]}
+    completed_orders = {c["checkpoint_order"] for c in checkpoints if c["completed"]}
 
     current_status = CHECKPOINT_GROUPS[0]["name"]  # "Not started"
-    for group in CEHCKPOINT_GROUPS:
+    for group in CHECKPOINT_GROUPS:
         if not group["checkpoints"]:
             continue
         if all(order in completed_orders for order in group["checkpoints"]):
             current_status = group["name"]
 
     return current_status
+
+
+def add_checkpoint(task_id: int, name: str, checkpoint_type: str = "check") -> int:
+    """Adds a new checkpoint at the end of the kanban list of the task."""
+    now = datetime.now().isoformat()
+    with get_connection() as conn:
+        max_order = conn.execute(
+            "SELECT COALESCE(MAX(checkpoint_order), 0) FROM task_checkpoints WHERE task_id = ?",
+            (task_id,)
+        ).fetchone()[0]
+        cur = conn.execute(
+            """INSERT INTO task_checkpoints
+               (task_id, checkpoint_order, name, checkpoint_type, completed, iteration_count)
+               VALUES (?, ?, ?, ?, 0, 0)""",
+            (task_id, max_order + 1, name, checkpoint_type)
+        )
+        conn.execute(
+            "UPDATE tasks SET updated_at = ? WHERE id = ?", (now, task_id)
+        )
+    return cur.lastrowid
+
+
+def delete_checkpoint(checkpoint_id: int):
+    """Deletes a checkpoint and renumbers the remaining checkpoints of the task."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT task_id, checkpoint_order FROM task_checkpoints WHERE id = ?", (checkpoint_id,)
+        ).fetchone()
+        if not row:
+            return
+        task_id, deleted_order = row[0], row[1]
+        conn.execute("DELETE FROM task_checkpoints WHERE id = ?", (checkpoint_id,))
+        # Shift down all checkpoints above the deleted one
+        conn.execute(
+            "UPDATE task_checkpoints SET checkpoint_order = checkpoint_order - 1 "
+            "WHERE task_id = ? AND checkpoint_order > ?",
+            (task_id, deleted_order)
+        )
+        conn.execute(
+            "UPDATE tasks SET updated_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), task_id)
+        )
+
+
+def update_checkpoint(checkpoint_id: int, name: str, checkpoint_type: str):
+    """Updates name and type of a checkpoint."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE task_checkpoints SET name = ?, checkpoint_type = ? WHERE id = ?",
+            (name, checkpoint_type, checkpoint_id)
+        )
+        task_id = conn.execute(
+            "SELECT task_id FROM task_checkpoints WHERE id = ?", (checkpoint_id,)
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE tasks SET updated_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), task_id)
+        )
+
+
+def move_checkpoint(task_id: int, checkpoint_id: int, direction: str):
+    """Moves a checkpoint up ('up') or down ('down') by swapping checkpoint_order with its neighbour."""
+    with get_connection() as conn:
+        current = conn.execute(
+            "SELECT checkpoint_order FROM task_checkpoints WHERE id = ?", (checkpoint_id,)
+        ).fetchone()
+        if not current:
+            return
+        current_order = current[0]
+        target_order = current_order - 1 if direction == "up" else current_order + 1
+
+        neighbor = conn.execute(
+            "SELECT id FROM task_checkpoints WHERE task_id = ? AND checkpoint_order = ?",
+            (task_id, target_order)
+        ).fetchone()
+        if not neighbor:
+            return  # already at the edge of the list
+
+        conn.execute(
+            "UPDATE task_checkpoints SET checkpoint_order = ? WHERE id = ?",
+            (target_order, checkpoint_id)
+        )
+        conn.execute(
+            "UPDATE task_checkpoints SET checkpoint_order = ? WHERE id = ?",
+            (current_order, neighbor[0])
+        )
+        conn.execute(
+            "UPDATE tasks SET updated_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), task_id)
+        )
 
 
 # ---------------------------------------------------------------------------

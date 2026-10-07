@@ -24,10 +24,10 @@ CHECKPOINTS = [
   {"order": 10, "name": "Closed", "type": "check"},
 ]
 
-# Checkpoint groups aka stages = Task status when all checkpoints of stage are completed
-# "checkpoints": checkpoints assigned to stage
-# Stage with no checkpoints = initial state, not checkpoints marked.
-STAGES = [
+# Checkpoint groups = Task status when all checkpoints of group are completed
+# "checkpoints": checkpoints assigned to group
+# Group with no checkpoints = initial state, not checkpoints marked.
+CHECKPOINT_GROUPS = [
   {"name": "Not started", "checkpoints": []},
   {"name": "Planned", "checkpoints": [1]},
   {"name": "Started", "checkpoints": [2]},
