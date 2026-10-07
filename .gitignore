@@ -8,4 +8,5 @@ dashboard-stages.md
 .idea/
 __pycache__/
 archive/
-
+backups/
+settings.json

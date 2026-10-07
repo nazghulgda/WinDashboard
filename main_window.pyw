@@ -11,25 +11,14 @@ from database import (
 )
 from config import APP_TITLE, MAIN_WINDOW_SIZE, STATUS_COLORS, CHECKPOINTS
 from archive import export_task_to_zip, import_task_from_zip, list_archive, remove_archived_task
+from backup import create_backup, list_backups, delete_backup
+from theme import load_theme, get_colors, SettingsDialog
 
-COLORS = {
-    "bg":            "#1a1a2e",
-    "panel":         "#16213e",
-    "card":          "#0f3460",
-    "card_hover":    "#1a4a7a",
-    "accent":        "#e94560",
-    "accent2":       "#f5a623",
-    "text":          "#eaeaea",
-    "text_dim":      "#8899aa",
-    "progress_bg":   "#0a1628",
-    "progress_fg":   "#e94560",
-    "btn":           "#e94560",
-    "btn_hover":     "#c73652",
-    "btn_secondary": "#0f3460",
-    "btn_sec_hover": "#1a4a7a",
-    "scrollbar":     "#0f3460",
-    "border":        "#1e3a5f",
-}
+# Load theme on module import
+load_theme()
+
+# COLORS is a reference to the active theme dictionary — updated in place by set_theme()
+COLORS = get_colors()
 
 FONT_TITLE   = ("Segoe UI", 20, "bold")
 FONT_HEADING = ("Segoe UI", 12, "bold")
@@ -103,6 +92,10 @@ class MainWindow:
         self._make_button(header, "📦 Archive",  lambda: self._open_archive(),
                           side="right", padx=(0, 4), pady=12, secondary=True)
         self._make_button(header, "⏸ On Hold",    lambda: self._open_on_hold(),
+                          side="right", padx=(0, 4), pady=12, secondary=True)
+        self._make_button(header, "💾 Backup",    lambda: self._open_backup(),
+                          side="right", padx=(0, 4), pady=12, secondary=True)
+        self._make_button(header, "⚙ Settings",  lambda: self._open_settings(),
                           side="right", padx=(0, 4), pady=12, secondary=True)
 
         tk.Frame(self.root, bg=COLORS["accent"], height=2).pack(fill="x")
@@ -361,6 +354,30 @@ class MainWindow:
             )
         except Exception as e:
             messagebox.showerror("Error", f"Failed to archive task:\n{e}", parent=self.root)
+
+    def _open_backup(self):
+        BackupWindow(self.root)
+
+    def _open_settings(self):
+        def on_theme_change():
+            # Close all open task windows before rebuilding UI
+            for tw in list(self._task_windows.values()):
+                try:
+                    if tw.window.winfo_exists():
+                        tw.window.destroy()
+                except Exception:
+                    pass
+            self._task_windows.clear()
+
+            # Destroy and rebuild whole UI of the main window
+            for w in self.root.winfo_children():
+                w.destroy()
+
+            self.root.configure(bg=COLORS["bg"])
+            self._build_ui()
+            self._load_tasks()
+
+        SettingsDialog(self.root, on_theme_change=on_theme_change)
 
     def _open_on_hold(self):
         OnHoldWindow(self.root, on_restore=self._load_tasks, on_archive=self._load_tasks)
@@ -629,6 +646,203 @@ class OnHoldWindow:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to archive task:\n{e}",
                                  parent=self.window)
+
+
+# ---------------------------------------------------------------------------
+# Window: Backup
+# ---------------------------------------------------------------------------
+
+class BackupWindow:
+    def __init__(self, parent):
+        self.window = tk.Toplevel(parent)
+        self.window.title("Dashboard Backup")
+        self.window.configure(bg=COLORS["bg"])
+        self.window.geometry("680x500")
+        self.window.minsize(520, 360)
+
+        header = tk.Frame(self.window, bg=COLORS["panel"])
+        header.pack(fill="x")
+        tk.Label(header, text="💾  BACKUP", font=FONT_TITLE,
+                 bg=COLORS["panel"], fg=COLORS["accent"],
+                 padx=20, pady=14).pack(side="left")
+
+        # Create backup button
+        create_btn = tk.Label(
+            header, text="+ Create backup", font=FONT_BODY,
+            bg=COLORS["btn"], fg="white",
+            padx=14, pady=6, cursor="hand2"
+        )
+        create_btn.pack(side="right", padx=12, pady=12)
+        create_btn.bind("<Button-1>", lambda e: self._create_backup(create_btn))
+        create_btn.bind("<Enter>", lambda e: create_btn.config(bg=COLORS["btn_hover"]))
+        create_btn.bind("<Leave>", lambda e: create_btn.config(bg=COLORS["btn"]))
+
+        tk.Frame(self.window, bg=COLORS["accent"], height=2).pack(fill="x")
+
+        # Status bar (backup progress)
+        self.status_bar = tk.Frame(self.window, bg=COLORS["panel"])
+        self.status_label = tk.Label(
+            self.status_bar, text="", font=FONT_SMALL,
+            bg=COLORS["panel"], fg=COLORS["text_dim"], padx=16, pady=6
+        )
+        self.status_label.pack(side="left")
+
+        # Backups list
+        self.list_frame = tk.Frame(self.window, bg=COLORS["bg"])
+        self.list_frame.pack(fill="both", expand=True, padx=16, pady=12)
+
+        self.canvas = tk.Canvas(self.list_frame, bg=COLORS["bg"], highlightthickness=0, bd=0)
+        sb = tk.Scrollbar(self.list_frame, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.cards_frame = tk.Frame(self.canvas, bg=COLORS["bg"])
+        cw = self.canvas.create_window((0, 0), window=self.cards_frame, anchor="nw")
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(cw, width=e.width))
+        self.cards_frame.bind("<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        _setup_mousewheel_scroll(self.canvas)
+
+        self._load()
+
+    def _load(self):
+        for w in self.cards_frame.winfo_children():
+            w.destroy()
+
+        backups = list_backups()
+
+        if not backups:
+            tk.Label(
+                self.cards_frame,
+                text="No backups available. Click '+ Create backup' to create the first one.",
+                font=FONT_BODY, bg=COLORS["bg"], fg=COLORS["text_dim"],
+                pady=40
+            ).pack()
+            return
+
+        for b in backups:
+            self._make_card(b)
+
+    def _make_card(self, b: dict):
+        meta = b.get("meta", {})
+        card = tk.Frame(self.cards_frame, bg=COLORS["card"], pady=10, padx=14)
+        card.pack(fill="x", pady=3, padx=2)
+
+        tk.Frame(card, bg=COLORS["accent2"], width=4).pack(
+            side="left", fill="y", padx=(0, 12))
+
+        info = tk.Frame(card, bg=COLORS["card"])
+        info.pack(side="left", fill="both", expand=True)
+
+        # Line 1: file name + size
+        row1 = tk.Frame(info, bg=COLORS["card"])
+        row1.pack(fill="x")
+        tk.Label(row1, text=b["filename"], font=FONT_BODY,
+                 bg=COLORS["card"], fg=COLORS["text"], anchor="w").pack(side="left")
+        tk.Label(row1, text=f"{b['size_mb']} MB", font=FONT_SMALL,
+                 bg=COLORS["card"], fg=COLORS["text_dim"]).pack(side="right")
+
+        # Line 2: statistics from metadata
+        if meta:
+            stats = (
+                f"Tasks: {meta.get('tasks_active', '?')} active, "
+                f"{meta.get('tasks_on_hold', '?')} on hold, "
+                f"{meta.get('tasks_archived', '?')} archived  |  "
+                f"Packed: {meta.get('packed_files', '?')} files"
+            )
+        else:
+            stats = "No metadata"
+        tk.Label(info, text=stats, font=FONT_SMALL,
+                 bg=COLORS["card"], fg=COLORS["text_dim"], anchor="w").pack(fill="x", pady=(2, 0))
+
+        # Date
+        tk.Label(info, text=f"Created: {b['date']}", font=FONT_SMALL,
+                 bg=COLORS["card"], fg=COLORS["text_dim"], anchor="w").pack(fill="x")
+
+        # Buttons
+        actions = tk.Frame(card, bg=COLORS["card"])
+        actions.pack(side="right", padx=(12, 0))
+
+        open_btn = tk.Label(actions, text="📂 Open folder", font=FONT_SMALL,
+                            bg=COLORS["btn_secondary"], fg=COLORS["text_dim"],
+                            padx=8, pady=4, cursor="hand2")
+        open_btn.pack(pady=(0, 4))
+        open_btn.bind("<Button-1>",
+            lambda e, p=b["zip_path"]: self._open_folder(p))
+        open_btn.bind("<Enter>", lambda e: open_btn.config(fg=COLORS["text"]))
+        open_btn.bind("<Leave>", lambda e: open_btn.config(fg=COLORS["text_dim"]))
+
+        del_btn = tk.Label(actions, text="🗑 Delete", font=FONT_SMALL,
+                           bg="#3a1515", fg="#ff9999",
+                           padx=8, pady=4, cursor="hand2")
+        del_btn.pack()
+        del_btn.bind("<Button-1>",
+            lambda e, p=b["zip_path"], fn=b["filename"]: self._delete(p, fn))
+        del_btn.bind("<Enter>", lambda e: del_btn.config(bg="#5a2020"))
+        del_btn.bind("<Leave>", lambda e: del_btn.config(bg="#3a1515"))
+
+    def _create_backup(self, btn: tk.Label):
+        """Runs backup and updates status in UI."""
+        btn.config(text="⏳ Creating...", bg=COLORS["text_dim"], cursor="")
+        btn.unbind("<Button-1>")
+
+        # Show status bar
+        self.status_bar.pack(fill="x", before=self.list_frame)
+        self.status_label.config(text="Preparing backup...")
+        self.window.update()
+
+        def on_progress(arc_name: str, current: int, total: int):
+            short = arc_name if len(arc_name) <= 60 else "..." + arc_name[-57:]
+            self.status_label.config(
+                text=f"Packing {current}/{total}: {short}")
+            self.window.update_idletasks()
+
+        try:
+            zip_path = create_backup(progress_callback=on_progress)
+            self.status_bar.pack_forget()
+            self._load()
+            messagebox.showinfo(
+                "Backup Created",
+                f"Backup has been saved:\n{zip_path}",
+                parent=self.window
+            )
+        except Exception as ex:
+            self.status_bar.pack_forget()
+            messagebox.showerror(
+                "Backup Error",
+                f"Failed to create backup:\n{ex}",
+                parent=self.window
+            )
+        finally:
+            btn.config(text="+ Create backup", bg=COLORS["btn"], cursor="hand2")
+            btn.bind("<Button-1>", lambda e: self._create_backup(btn))
+
+    def _open_folder(self, zip_path: str):
+        """Opens backup folder in Windows Explorer."""
+        folder = os.path.dirname(zip_path)
+        try:
+            os.startfile(folder)
+        except Exception as ex:
+            messagebox.showerror("Error",
+                f"Can't open folder:\n{folder}\n\n{ex}",
+                parent=self.window)
+
+    def _delete(self, zip_path: str, filename: str):
+        if not messagebox.askyesno(
+            "Delete Backup",
+            f"Are you sure you want to delete the backup?\n\n{filename}\n\n"
+            "This operation can not be undone.",
+            parent=self.window
+        ):
+            return
+        try:
+            delete_backup(zip_path)
+            self._load()
+        except Exception as ex:
+            messagebox.showerror("Error",
+                f"Failed to delete backup:\n{ex}",
+                parent=self.window)
 
 
 # ---------------------------------------------------------------------------

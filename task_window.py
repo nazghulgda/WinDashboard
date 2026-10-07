@@ -16,31 +16,13 @@ from database import (
     add_checkpoint, delete_checkpoint, update_checkpoint, move_checkpoint,
 )
 
+from theme import get_colors
+
 # ---------------------------------------------------------------------------
-# Palette — identical as in main_window.py
+# Palette — from the active theme (theme.py)
 # ---------------------------------------------------------------------------
 
-COLORS = {
-    "bg":           "#1a1a2e",
-    "panel":        "#16213e",
-    "card":         "#0f3460",
-    "card_hover":   "#1a4a7a",
-    "accent":       "#e94560",
-    "accent2":      "#f5a623",
-    "text":         "#eaeaea",
-    "text_dim":     "#8899aa",
-    "progress_bg":  "#0a1628",
-    "progress_fg":  "#e94560",
-    "btn":          "#e94560",
-    "btn_hover":    "#c73652",
-    "btn_secondary":"#0f3460",
-    "card_hover2":  "#1e3a5f",
-    "border":       "#1e3a5f",
-    "check_on":     "#e94560",
-    "check_off":    "#0a1628",
-    "checkpoint_done":   "#1a3a1a",
-    "checkpoint_undone": "#0f3460",
-}
+COLORS = get_colors()
 
 FONT_TITLE   = ("Segoe UI", 16, "bold")
 FONT_HEADING = ("Segoe UI", 11, "bold")
