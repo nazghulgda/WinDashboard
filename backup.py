@@ -2,10 +2,12 @@
 
 import os
 import json
+import sqlite3
+import tempfile
 import zipfile
 from datetime import datetime
 
-from config import DB_PATH, ARCHIVE_DIR
+from config import DB_PATH, ARCHIVE_DIR, ATTACHMENTS_DIR, APP_VERSION
 
 # Backups folder — next to the database
 APP_DIR    = os.path.dirname(os.path.abspath(DB_PATH))
@@ -19,7 +21,7 @@ BACKUP_DIR = os.path.join(APP_DIR, "backups")
 def create_backup(progress_callback=None) -> str:
     """
     Creates full backup of the application as a ZIP file.
-    Collects: database, database backup copy, tasks archives.
+    Collects: database, database backup copy, attachments, tasks archives.
     Returns path of the created ZIP file.
 
     progress_callback: optional function(name: str, current: int, total: int)
@@ -27,7 +29,7 @@ def create_backup(progress_callback=None) -> str:
     """
     os.makedirs(BACKUP_DIR, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     zip_name  = f"WinDashboard_backup_{timestamp}.zip"
     zip_path  = os.path.join(BACKUP_DIR, zip_name)
 
@@ -70,6 +72,14 @@ def _collect_files() -> list[tuple[str, str]]:
     if os.path.exists(bak_path):
         files.append((bak_path, "tasks.db.bak"))
 
+    # Attachments — whole folder structure
+    if os.path.exists(ATTACHMENTS_DIR):
+        for root, _, fnames in os.walk(ATTACHMENTS_DIR):
+            for fname in fnames:
+                src = os.path.join(root, fname)
+                rel = os.path.relpath(src, APP_DIR)
+                files.append((src, rel.replace("\\", "/")))
+
     # Tasks archives — archive/ folder
     if os.path.exists(ARCHIVE_DIR):
         for fname in os.listdir(ARCHIVE_DIR):
@@ -103,13 +113,19 @@ def _build_meta(file_count: int) -> dict:
         archive_count = len([f for f in os.listdir(ARCHIVE_DIR)
                              if f.endswith(".zip")])
 
+    att_count = 0
+    if os.path.exists(ATTACHMENTS_DIR):
+        for _, _, fnames in os.walk(ATTACHMENTS_DIR):
+            att_count += len(fnames)
+
     return {
-        "backup_date":    datetime.now().isoformat(),
-        "app_version":    "1.0",
-        "tasks_active":   active,
-        "tasks_on_hold":  on_hold,
-        "tasks_archived": archive_count,
-        "packed_files":   file_count,
+        "backup_date":      datetime.now().isoformat(),
+        "app_version":      APP_VERSION,
+        "tasks_active":     active,
+        "tasks_on_hold":    on_hold,
+        "tasks_archived":   archive_count,
+        "attachment_files": att_count,
+        "packed_files":     file_count,
     }
 
 
@@ -146,6 +162,122 @@ def list_backups() -> list[dict]:
             "date":      meta.get("backup_date", "")[:16].replace("T", "  "),
         })
     return result
+
+
+# ---------------------------------------------------------------------------
+# Restoring a backup
+# ---------------------------------------------------------------------------
+
+def restore_backup(zip_path: str) -> dict:
+    """
+    Restores a backup by merging it with the current data.
+    Tasks and archived tasks which are missing now are added from the backup;
+    nothing existing is changed or removed. A task is recognized by its title
+    and creation date, so a task which exists now (active, on hold or archived)
+    is never added for the second time.
+    Returns: {tasks_added, tasks_skipped, archives_added}
+    """
+    from database import init_db, get_connection
+    from archive import insert_task_data
+
+    init_db()
+    result = {"tasks_added": 0, "tasks_skipped": 0, "archives_added": 0}
+
+    # Tasks known now: in the database and in the archive folder
+    with get_connection() as conn:
+        known = {(r[0], r[1]) for r in conn.execute("SELECT title, created_at FROM tasks")}
+    if os.path.exists(ARCHIVE_DIR):
+        for fname in os.listdir(ARCHIVE_DIR):
+            if fname.endswith(".zip"):
+                key = _archived_task_key(os.path.join(ARCHIVE_DIR, fname))
+                if key:
+                    known.add(key)
+
+    with tempfile.TemporaryDirectory() as tmp_dir, zipfile.ZipFile(zip_path, "r") as zf:
+        names = set(zf.namelist())
+
+        # Tasks from the database of the backup
+        if "tasks.db" in names:
+            db_copy = os.path.join(tmp_dir, "tasks.db")
+            with zf.open("tasks.db") as src, open(db_copy, "wb") as dst:
+                dst.write(src.read())
+
+            def open_attachment(att: dict):
+                arc_name = att["stored_path"].replace("\\", "/")
+                return zf.open(arc_name) if arc_name in names else None
+
+            for data in _read_tasks(db_copy):
+                key = (data["task"]["title"], data["task"]["created_at"])
+                if key in known:
+                    result["tasks_skipped"] += 1
+                    continue
+                insert_task_data(data, bool(data["task"].get("on_hold")), open_attachment)
+                known.add(key)
+                result["tasks_added"] += 1
+
+        # Archived tasks
+        for name in sorted(names):
+            if not name.startswith("archive/") or not name.endswith(".zip"):
+                continue
+            if name.startswith("archive/removed/"):
+                continue  # removed from the archive on purpose
+            fname = os.path.basename(name)
+            dest  = os.path.join(ARCHIVE_DIR, fname)
+            if os.path.exists(dest):
+                continue
+            tmp_zip = os.path.join(tmp_dir, fname)
+            with zf.open(name) as src, open(tmp_zip, "wb") as dst:
+                dst.write(src.read())
+            key = _archived_task_key(tmp_zip)
+            if key is None or key in known:
+                continue
+            os.makedirs(ARCHIVE_DIR, exist_ok=True)
+            os.replace(tmp_zip, dest)
+            known.add(key)
+            result["archives_added"] += 1
+
+    return result
+
+
+def _archived_task_key(zip_path: str):
+    """Returns (title, created_at) of a task archived in the ZIP file, None if not readable."""
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            task = json.loads(zf.read("task.json").decode("utf-8")).get("task", {})
+        return (task["title"], task["created_at"])
+    except Exception:
+        return None
+
+
+def _read_tasks(db_path: str) -> list[dict]:
+    """Reads all tasks from a database file into the format of task.json.
+    Handles databases created before the checkpoint renaming as well."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        cp_table = "task_checkpoints" if "task_checkpoints" in tables else "task_stages"
+
+        def rows(table: str, task_id: int) -> list[dict]:
+            if table not in tables:
+                return []
+            return [dict(r) for r in conn.execute(
+                f"SELECT * FROM {table} WHERE task_id = ? ORDER BY id", (task_id,))]
+
+        result = []
+        for task in conn.execute("SELECT * FROM tasks ORDER BY id"):
+            task = dict(task)
+            result.append({
+                "task":        task,
+                "checkpoints": rows(cp_table, task["id"]),
+                "notes":       rows("task_notes", task["id"]),
+                "links":       rows("task_links", task["id"]),
+                "attachments": rows("task_attachments", task["id"]),
+            })
+        return result
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

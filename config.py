@@ -8,6 +8,9 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tasks.db")
 # Tasks archives folder
 ARCHIVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "archive")
 
+# Attachments folder
+ATTACHMENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "attachments")
+
 # Predefined kanban checkpoints
 # type: "check" = simple checkpoint
 # type: "counter" = iteration counter (buttons + / -)
@@ -25,8 +28,10 @@ CHECKPOINTS = [
 ]
 
 # Checkpoint groups = Task status when all checkpoints of group are completed
-# "checkpoints": checkpoints assigned to group
-# Group with no checkpoints = initial state, not checkpoints marked.
+# "checkpoints": checkpoints assigned to group (numbers from CHECKPOINTS above)
+# Groups are completed one after another, in the order given here.
+# First group = initial state, not checkpoints marked.
+# Last group = final state, all checkpoints of the task completed.
 CHECKPOINT_GROUPS = [
   {"name": "Not started", "checkpoints": []},
   {"name": "Planned", "checkpoints": [1]},
@@ -37,9 +42,20 @@ CHECKPOINT_GROUPS = [
   {"name": "Finished", "checkpoints": [10]},
 ]
 
+# Checkpoint created for a task with "Empty Kanban" — a task always has at least one checkpoint
+DEFAULT_CHECKPOINT = {"order": 1, "name": "Task completed", "type": "check"}
+
+# Status of a started task when no checkpoint group is completed yet
+# (also used for tasks without checkpoints from the template)
+STATUS_IN_PROGRESS = "In progress"
+
 # Main program window settings
 APP_TITLE = "WinDashboard"
+APP_VERSION = "0.5.0"
 MAIN_WINDOW_SIZE = "900x600"
+
+# Database check interval in ms (600 000 ms = 10 minutes)
+DB_CHECK_INTERVAL_MS = 600_000
 
 # Task status colours
 STATUS_COLORS = {

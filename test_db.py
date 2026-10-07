@@ -1,7 +1,7 @@
 # Database structure verification
 
 from database import (
-    init_db, create_task, get_all_tasks, get_task,
+    init_db, create_task, get_all_tasks,
     get_checkpoints, set_checkpoint_completed, get_task_progress,
     create_note, get_notes,
     create_link, get_links,
@@ -56,4 +56,4 @@ delete_task(task_id)
 print(f"Task #{task_id} deleted (including checkpoints, notes and links)")
 print(f"Remaining tasks: {len(get_all_tasks())}")
 
-print(f"\n=== All tests finished succesfully. ===")
+print("\n=== All tests finished succesfully. ===")

@@ -10,3 +10,5 @@ __pycache__/
 archive/
 backups/
 settings.json
+attachments/
+tasks.db.corrupt_*

@@ -1,10 +1,18 @@
 # database.py — database structure and CRUD functions
 
 import os
+import re
 import shutil
 import sqlite3
 from datetime import datetime
-from config import DB_PATH, CHECKPOINTS, CHECKPOINT_GROUPS
+from config import (DB_PATH, ATTACHMENTS_DIR, CHECKPOINTS, CHECKPOINT_GROUPS,
+                    DEFAULT_CHECKPOINT, STATUS_IN_PROGRESS)
+
+# Application data folder — attachment paths are stored relative to it
+APP_DIR = os.path.dirname(os.path.abspath(DB_PATH))
+
+# Last working copy of the database
+LAST_WORKING_PATH = DB_PATH + ".bak"
 
 
 # ---------------------------------------------------------------------------
@@ -44,7 +52,8 @@ def init_db():
                 name            TEXT    NOT NULL,
                 checkpoint_type TEXT    NOT NULL DEFAULT 'check',
                 completed       INTEGER NOT NULL DEFAULT 0,
-                iteration_count INTEGER NOT NULL DEFAULT 0
+                iteration_count INTEGER NOT NULL DEFAULT 0,
+                template_order  INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS task_notes (
@@ -63,6 +72,15 @@ def init_db():
                 path        TEXT    NOT NULL,
                 link_type   TEXT    NOT NULL DEFAULT 'file'
             );
+
+            CREATE TABLE IF NOT EXISTS task_attachments (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id     INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                filename    TEXT    NOT NULL,
+                stored_path TEXT    NOT NULL,
+                deleted     INTEGER NOT NULL DEFAULT 0,
+                added_at    TEXT    NOT NULL
+            );
         """)
 
         # Migration for existing databases
@@ -71,6 +89,13 @@ def init_db():
             conn.execute("ALTER TABLE task_checkpoints ADD COLUMN checkpoint_type TEXT NOT NULL DEFAULT 'check'")
         if "iteration_count" not in cp_cols:
             conn.execute("ALTER TABLE task_checkpoints ADD COLUMN iteration_count INTEGER NOT NULL DEFAULT 0")
+        if "template_order" not in cp_cols:
+            conn.execute("ALTER TABLE task_checkpoints ADD COLUMN template_order INTEGER")
+            # Existing checkpoints are matched with the template by name
+            conn.executemany(
+                "UPDATE task_checkpoints SET template_order = ? WHERE name = ?",
+                [(c["order"], c["name"]) for c in CHECKPOINTS]
+            )
 
         tasks_cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()]
         if "on_hold" not in tasks_cols:
@@ -98,16 +123,99 @@ def _migrate_legacy_stage_names(conn):
 
 
 # ---------------------------------------------------------------------------
+# Database check and last working copy
+# ---------------------------------------------------------------------------
+
+def check_db(path: str = DB_PATH) -> bool:
+    """Checks if the database file can be opened and its structure is not damaged."""
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+        finally:
+            conn.close()
+        return bool(row) and row[0] == "ok"
+    except Exception:
+        return False
+
+
+def backup_db() -> bool:
+    """Saves the database as the last working copy (tasks.db.bak).
+    Only a database which passes the check is copied, so a damaged
+    database never replaces a good copy. Returns True if the copy was saved."""
+    if not os.path.exists(DB_PATH) or not check_db():
+        return False
+    tmp_path = LAST_WORKING_PATH + ".tmp"
+    try:
+        src = sqlite3.connect(DB_PATH)
+        dst = sqlite3.connect(tmp_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+            src.close()
+        os.replace(tmp_path, LAST_WORKING_PATH)
+        return True
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
+
+
+def verify_db() -> str:
+    """Checks the database and restores it from the last working copy if it is damaged.
+    Returns:
+      "ok"       — database is fine (or does not exist yet and there is no copy)
+      "restored" — database was damaged or missing and was restored from the last working copy
+      "failed"   — database is damaged and there is no working copy to restore from
+    The damaged file is never deleted — it is kept as tasks.db.corrupt_<date>_<time>."""
+    has_db   = os.path.exists(DB_PATH)
+    has_copy = os.path.exists(LAST_WORKING_PATH) and os.path.getsize(LAST_WORKING_PATH) > 0
+
+    if has_db:
+        # Empty file is a valid empty database for SQLite — treat it as damaged when a copy exists
+        emptied = os.path.getsize(DB_PATH) == 0 and has_copy
+        if not emptied and check_db():
+            return "ok"
+    elif not has_copy:
+        return "ok"
+
+    if not has_copy or not check_db(LAST_WORKING_PATH):
+        return "failed"
+
+    try:
+        if has_db:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            os.replace(DB_PATH, f"{DB_PATH}.corrupt_{stamp}")
+        shutil.copy2(LAST_WORKING_PATH, DB_PATH)
+    except Exception:
+        return "failed"
+    return "restored" if check_db() else "failed"
+
+
+def _touch_task(conn, task_id: int):
+    """Marks activity in the task — every change inside a task updates its updated_at."""
+    conn.execute(
+        "UPDATE tasks SET updated_at = ? WHERE id = ?",
+        (datetime.now().isoformat(), task_id)
+    )
+
+
+# ---------------------------------------------------------------------------
 # TASKS
 # ---------------------------------------------------------------------------
 
 def create_task(title: str, description: str = "", checkpoints: list = None) -> int:
     """Creates new task.
     checkpoints=None  -> default checkpoints from config.CHECKPOINTS
-    checkpoints=[]    -> empty kanban (no checkpoints)
+    checkpoints=[]    -> empty kanban (config.DEFAULT_CHECKPOINT only)
     checkpoints=[...] -> given list of checkpoints in config.CHECKPOINTS format
     """
-    checkpoints_to_use = CHECKPOINTS if checkpoints is None else checkpoints
+    from_template = checkpoints is None
+    checkpoints_to_use = CHECKPOINTS if from_template else (checkpoints or [DEFAULT_CHECKPOINT])
 
     now = datetime.now().isoformat()
     with get_connection() as conn:
@@ -116,13 +224,15 @@ def create_task(title: str, description: str = "", checkpoints: list = None) -> 
             (title, description, now, now)
         )
         task_id = cur.lastrowid
-        if checkpoints_to_use:
-            conn.executemany(
-                """INSERT INTO task_checkpoints
-                   (task_id, checkpoint_order, name, checkpoint_type, completed, iteration_count)
-                   VALUES (?, ?, ?, ?, 0, 0)""",
-                [(task_id, c["order"], c["name"], c.get("type", "check")) for c in checkpoints_to_use]
-            )
+        # template_order binds a checkpoint to config.CHECKPOINT_GROUPS — only for the template
+        conn.executemany(
+            """INSERT INTO task_checkpoints
+               (task_id, checkpoint_order, name, checkpoint_type, completed, iteration_count,
+                template_order)
+               VALUES (?, ?, ?, ?, 0, 0, ?)""",
+            [(task_id, c["order"], c["name"], c.get("type", "check"),
+              c["order"] if from_template else None) for c in checkpoints_to_use]
+        )
     return task_id
 
 
@@ -174,7 +284,8 @@ def set_on_hold(task_id: int, on_hold: bool):
 
 
 def get_last_activity(task_id: int) -> str:
-    """Returns last activity date in task (task + checkpoints + notes)."""
+    """Returns last activity date in task.
+    Every change in a task (checkpoints, notes, links, attachments) updates updated_at of the task."""
     with get_connection() as conn:
         task_upd = conn.execute(
             "SELECT updated_at FROM tasks WHERE id = ?", (task_id,)
@@ -182,27 +293,12 @@ def get_last_activity(task_id: int) -> str:
         note_upd = conn.execute(
             "SELECT MAX(updated_at) FROM task_notes WHERE task_id = ?", (task_id,)
         ).fetchone()
-        # Checkpoints do not have updated_at — used updated_at from task (updated with toggle)
         dates = [
             task_upd[0] if task_upd else None,
             note_upd[0] if note_upd else None,
         ]
         dates = [d for d in dates if d]
     return max(dates) if dates else ""
-
-
-def backup_db():
-    """Creates a backup copy of the database (tasks.db.bak).
-    Replaces the previous copy. Silent on error."""
-    if not os.path.exists(DB_PATH):
-        return
-    backup_path = DB_PATH + ".bak"
-    try:
-        if os.path.exists(backup_path):
-            os.remove(backup_path)
-        shutil.copy2(DB_PATH, backup_path)
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -267,16 +363,35 @@ def get_task_progress(task_id: int) -> tuple[int, int]:
 
 
 def get_task_checkpoint_status(task_id: int) -> str:
-    """Returns actual status name of task based on CHECKPOINT_GROUPS."""
-    checkpoints = get_checkpoints(task_id)
-    completed_orders = {c["checkpoint_order"] for c in checkpoints if c["completed"]}
+    """Returns actual status name of task.
 
-    current_status = CHECKPOINT_GROUPS[0]["name"]  # "Not started"
-    for group in CHECKPOINT_GROUPS:
-        if not group["checkpoints"]:
+    No checkpoint completed   -> name of the first group in CHECKPOINT_GROUPS
+    All checkpoints completed -> name of the last group in CHECKPOINT_GROUPS
+    Otherwise                 -> name of the last group completed in a row; groups are bound
+                                 to checkpoints from the template (template_order), not to
+                                 their current position, so moving, adding or deleting
+                                 checkpoints does not change the meaning of a group.
+    Task without template checkpoints, or with no group completed yet -> STATUS_IN_PROGRESS."""
+    checkpoints = get_checkpoints(task_id)
+    done = sum(1 for c in checkpoints if c["completed"])
+
+    if done == 0:
+        return CHECKPOINT_GROUPS[0]["name"]
+    if done == len(checkpoints):
+        return CHECKPOINT_GROUPS[-1]["name"]
+
+    completed = {c["template_order"]: bool(c["completed"])
+                 for c in checkpoints if c["template_order"] is not None}
+
+    current_status = STATUS_IN_PROGRESS
+    for group in CHECKPOINT_GROUPS[:-1]:
+        # Checkpoints of the group which still exist in this task
+        present = [order for order in group["checkpoints"] if order in completed]
+        if not present:
             continue
-        if all(order in completed_orders for order in group["checkpoints"]):
-            current_status = group["name"]
+        if not all(completed[order] for order in present):
+            break
+        current_status = group["name"]
 
     return current_status
 
@@ -301,15 +416,21 @@ def add_checkpoint(task_id: int, name: str, checkpoint_type: str = "check") -> i
     return cur.lastrowid
 
 
-def delete_checkpoint(checkpoint_id: int):
-    """Deletes a checkpoint and renumbers the remaining checkpoints of the task."""
+def delete_checkpoint(checkpoint_id: int) -> bool:
+    """Deletes a checkpoint and renumbers the remaining checkpoints of the task.
+    The last checkpoint of a task can not be deleted. Returns True if deleted."""
     with get_connection() as conn:
         row = conn.execute(
             "SELECT task_id, checkpoint_order FROM task_checkpoints WHERE id = ?", (checkpoint_id,)
         ).fetchone()
         if not row:
-            return
+            return False
         task_id, deleted_order = row[0], row[1]
+        count = conn.execute(
+            "SELECT COUNT(*) FROM task_checkpoints WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+        if count <= 1:
+            return False
         conn.execute("DELETE FROM task_checkpoints WHERE id = ?", (checkpoint_id,))
         # Shift down all checkpoints above the deleted one
         conn.execute(
@@ -321,6 +442,7 @@ def delete_checkpoint(checkpoint_id: int):
             "UPDATE tasks SET updated_at = ? WHERE id = ?",
             (datetime.now().isoformat(), task_id)
         )
+    return True
 
 
 def update_checkpoint(checkpoint_id: int, name: str, checkpoint_type: str):
@@ -382,6 +504,7 @@ def create_note(task_id: int, title: str, content: str = "") -> int:
             "INSERT INTO task_notes (task_id, title, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
             (task_id, title, content, now, now)
         )
+        _touch_task(conn, task_id)
     return cur.lastrowid
 
 
@@ -401,11 +524,11 @@ def update_note(note_id: int, title: str, content: str):
             "UPDATE task_notes SET title = ?, content = ?, updated_at = ? WHERE id = ?",
             (title, content, now, note_id)
         )
-
-
-def delete_note(note_id: int):
-    with get_connection() as conn:
-        conn.execute("DELETE FROM task_notes WHERE id = ?", (note_id,))
+        row = conn.execute(
+            "SELECT task_id FROM task_notes WHERE id = ?", (note_id,)
+        ).fetchone()
+        if row:
+            _touch_task(conn, row[0])
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +541,7 @@ def create_link(task_id: int, label: str, path: str, link_type: str = "file") ->
             "INSERT INTO task_links (task_id, label, path, link_type) VALUES (?, ?, ?, ?)",
             (task_id, label, path, link_type)
         )
+        _touch_task(conn, task_id)
     return cur.lastrowid
 
 
@@ -435,8 +559,83 @@ def update_link(link_id: int, label: str, path: str, link_type: str):
             "UPDATE task_links SET label = ?, path = ?, link_type = ? WHERE id = ?",
             (label, path, link_type, link_id)
         )
+        row = conn.execute(
+            "SELECT task_id FROM task_links WHERE id = ?", (link_id,)
+        ).fetchone()
+        if row:
+            _touch_task(conn, row[0])
 
 
 def delete_link(link_id: int):
     with get_connection() as conn:
+        row = conn.execute(
+            "SELECT task_id FROM task_links WHERE id = ?", (link_id,)
+        ).fetchone()
         conn.execute("DELETE FROM task_links WHERE id = ?", (link_id,))
+        if row:
+            _touch_task(conn, row[0])
+
+
+# ---------------------------------------------------------------------------
+# TASK ATTACHMENTS
+# ---------------------------------------------------------------------------
+# Attachment = copy of a file kept in ATTACHMENTS_DIR/<task_id>_<task title>/.
+# stored_path is relative to the application folder and always uses "/",
+# so the whole folder can be moved or restored from a backup in another place.
+
+def get_attachment_dir(task_id: int, task_title: str) -> str:
+    """Returns path of the attachments folder of the task."""
+    safe_title = re.sub(r'[^\w\s-]', '', task_title).strip()
+    safe_title = re.sub(r'[\s]+', '_', safe_title)[:40]
+    return os.path.join(ATTACHMENTS_DIR, f"{task_id}_{safe_title}")
+
+
+def to_stored_path(path: str) -> str:
+    """Converts file path into the form kept in the database."""
+    return os.path.relpath(path, APP_DIR).replace("\\", "/")
+
+
+def resolve_attachment_path(stored_path: str) -> str:
+    """Returns full path of an attachment file from its stored_path."""
+    if os.path.isabs(stored_path):
+        return stored_path
+    return os.path.join(APP_DIR, *stored_path.split("/"))
+
+
+def create_attachment(task_id: int, filename: str, path: str) -> int:
+    """Registers new attachment. The file has to be already copied to path."""
+    now = datetime.now().isoformat()
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO task_attachments (task_id, filename, stored_path, deleted, added_at)
+               VALUES (?, ?, ?, 0, ?)""",
+            (task_id, filename, to_stored_path(path), now)
+        )
+        _touch_task(conn, task_id)
+    return cur.lastrowid
+
+
+def get_attachments(task_id: int, include_deleted: bool = False) -> list:
+    """Returns attachments of the task. include_deleted=True returns deleted ones as well."""
+    query = "SELECT * FROM task_attachments WHERE task_id = ?"
+    if not include_deleted:
+        query += " AND deleted = 0"
+    with get_connection() as conn:
+        rows = conn.execute(query + " ORDER BY added_at", (task_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def soft_delete_attachment(att_id: int, new_path: str):
+    """Marks attachment as deleted. new_path = place of the file after moving it
+    to the 'deleted' subfolder."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT task_id FROM task_attachments WHERE id = ?", (att_id,)
+        ).fetchone()
+        if not row:
+            return
+        conn.execute(
+            "UPDATE task_attachments SET deleted = 1, stored_path = ? WHERE id = ?",
+            (to_stored_path(new_path), att_id)
+        )
+        _touch_task(conn, row[0])

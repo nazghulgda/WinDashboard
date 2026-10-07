@@ -25,10 +25,8 @@ THEME_DARK = {
     "btn_hover":         "#c73652",
     "btn_secondary":     "#0f3460",
     "btn_sec_hover":     "#1a4a7a",
-    "scrollbar":         "#0f3460",
     "border":            "#1e3a5f",
     "check_on":          "#e94560",
-    "check_off":         "#0a1628",
     "checkpoint_done":   "#1a3a1a",
     "checkpoint_undone": "#0f3460",
 }
@@ -50,10 +48,8 @@ THEME_LIGHT = {
     "btn_hover":         "#1447b5",
     "btn_secondary":     "#e5e7eb",
     "btn_sec_hover":     "#d1d5db",
-    "scrollbar":         "#c8cdd6",
     "border":            "#d1d5db",
     "check_on":          "#1a56db",
-    "check_off":         "#ffffff",
     "checkpoint_done":   "#dcfce7",
     "checkpoint_undone": "#f9fafb",
 }

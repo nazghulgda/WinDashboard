@@ -1,21 +1,22 @@
 # task_window.py — single task window
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, colorchooser
+from tkinter import messagebox, filedialog
 import os
-import subprocess
 import re
+import shutil
 from datetime import datetime
 
 from database import (
     get_task, get_checkpoints, set_checkpoint_completed, set_iteration_count,
-    get_task_progress, get_task_checkpoint_status,
+    get_task_checkpoint_status,
     get_notes, create_note, update_note,
     get_links, create_link, update_link, delete_link,
     update_task,
     add_checkpoint, delete_checkpoint, update_checkpoint, move_checkpoint,
+    get_attachments, create_attachment, soft_delete_attachment,
+    get_attachment_dir, resolve_attachment_path,
 )
-
 from theme import get_colors
 
 # ---------------------------------------------------------------------------
@@ -57,14 +58,13 @@ class TaskWindow:
         self.window.geometry("1100x700")
         self.window.minsize(800, 500)
 
-        if on_close:
-            self.window.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
 
         self._open_note_windows = {}
         self._checkpoints_canvas = None  # reference to kanban canvas
         self._build_ui()
         self._load_all()
-        
+
     # -----------------------------------------------------------------------
     # Building layout
     # -----------------------------------------------------------------------
@@ -117,10 +117,19 @@ class TaskWindow:
         self.notes_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 12), pady=12)
         self._build_notes_panel(self.notes_frame)
 
-        self.links_frame = tk.Frame(main, bg=COLORS["bg"])
-        self.links_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
+        bottom = tk.Frame(main, bg=COLORS["bg"])
+        bottom.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
+        bottom.columnconfigure(0, weight=3)
+        bottom.columnconfigure(1, weight=2)
+
+        self.links_frame = tk.Frame(bottom, bg=COLORS["bg"])
+        self.links_frame.grid(row=0, column=0, sticky="new", padx=(0, 6))
         self._build_links_panel(self.links_frame)
-        
+
+        self.attachments_frame = tk.Frame(bottom, bg=COLORS["bg"])
+        self.attachments_frame.grid(row=0, column=1, sticky="new", padx=(6, 0))
+        self._build_attachments_panel(self.attachments_frame)
+
     # -----------------------------------------------------------------------
     # Panel: Kanban
     # -----------------------------------------------------------------------
@@ -159,7 +168,6 @@ class TaskWindow:
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(win_id, width=e.width))
         self.checkpoints_inner.bind("<Configure>",
             lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        _setup_mousewheel_scroll(canvas)
 
     def _load_kanban(self):
         for w in self.checkpoints_inner.winfo_children():
@@ -209,7 +217,6 @@ class TaskWindow:
     def _make_check_row(self, row: tk.Frame, checkpoint: dict, checkpoints_count: int):
         is_done = bool(checkpoint["completed"])
         bg = COLORS["checkpoint_done"] if is_done else COLORS["checkpoint_undone"]
-        order = checkpoint["checkpoint_order"]
 
         var = tk.BooleanVar(value=is_done)
         self._checkpoint_vars[checkpoint["id"]] = var
@@ -350,7 +357,13 @@ class TaskWindow:
         dialog = CheckpointEditDialog(self.window, checkpoint)
         self.window.wait_window(dialog.window)
         if dialog.result == "deleted":
-            delete_checkpoint(checkpoint["id"])
+            if not delete_checkpoint(checkpoint["id"]):
+                messagebox.showinfo(
+                    "Delete Checkpoint",
+                    "The last checkpoint of a task can not be deleted.\n\n"
+                    "A task needs at least one checkpoint to be finished.",
+                    parent=self.window
+                )
             self._load_kanban()
         elif dialog.result:
             update_checkpoint(checkpoint["id"], dialog.result["name"], dialog.result["checkpoint_type"])
@@ -408,7 +421,6 @@ class TaskWindow:
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(win_id, width=e.width))
         self.notes_inner.bind("<Configure>",
             lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        _setup_mousewheel_scroll(canvas)
 
     def _load_notes(self):
         for w in self.notes_inner.winfo_children():
@@ -507,14 +519,10 @@ class TaskWindow:
             update_note(note["id"], new_title, note.get("content") or "")
             note["title"] = new_title
             title_lbl.config(text=new_title)
-            if note["id"] in self._open_note_windows:
-                try:
-                    w = self._open_note_windows[note["id"]]
-                    if w.window.winfo_exists():
-                        w.window.title(new_title)
-                        w.note["title"] = new_title
-                except Exception:
-                    pass
+            # Note opened in the editor shows the new title as well
+            editor = self._open_note_windows.get(note["id"])
+            if editor is not None and _editor_alive(editor):
+                editor.set_title(new_title)
 
     # -----------------------------------------------------------------------
     # Panel: Links
@@ -645,15 +653,209 @@ class TaskWindow:
         self._load_links()
 
     # -----------------------------------------------------------------------
-    # Loading Everything
+    # Panel: Attachments
+    # -----------------------------------------------------------------------
+
+    def _build_attachments_panel(self, parent):
+        parent.columnconfigure(0, weight=1)
+
+        tk.Frame(parent, bg=COLORS["border"], height=1).pack(fill="x", pady=(0, 6))
+
+        hdr = tk.Frame(parent, bg=COLORS["panel"])
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="ATTACHMENTS", font=FONT_HEADING,
+                 bg=COLORS["panel"], fg=COLORS["accent"],
+                 padx=12, pady=6).pack(side="left")
+
+        add_btn = tk.Label(
+            hdr, text="+ Add file", font=FONT_SMALL,
+            bg=COLORS["btn"], fg="white",
+            padx=8, pady=4, cursor="hand2"
+        )
+        add_btn.pack(side="right", padx=(4, 8), pady=4)
+        add_btn.bind("<Button-1>", lambda e: self._add_attachment())
+        add_btn.bind("<Enter>", lambda e: add_btn.config(bg=COLORS["btn_hover"]))
+        add_btn.bind("<Leave>", lambda e: add_btn.config(bg=COLORS["btn"]))
+
+        self.attachments_container = tk.Frame(parent, bg=COLORS["bg"])
+        self.attachments_container.pack(fill="x", pady=(4, 0))
+
+    def _load_attachments(self):
+        for w in self.attachments_container.winfo_children():
+            w.destroy()
+
+        attachments = get_attachments(self.task_id)
+
+        if not attachments:
+            tk.Label(
+                self.attachments_container, text="No attachments.",
+                font=FONT_SMALL, bg=COLORS["bg"], fg=COLORS["text_dim"],
+                pady=6
+            ).pack(side="left")
+            return
+
+        for att in attachments:
+            self._make_attachment_chip(att)
+
+    def _make_attachment_chip(self, att: dict):
+        path = resolve_attachment_path(att["stored_path"])
+
+        chip = tk.Frame(
+            self.attachments_container, bg=COLORS["card"],
+            padx=8, pady=4, cursor="hand2"
+        )
+        chip.pack(side="left", padx=4, pady=4)
+
+        label_lbl = tk.Label(
+            chip, text=f"📎 {att['filename']}",
+            font=FONT_SMALL, bg=COLORS["card"], fg=COLORS["text"]
+        )
+        label_lbl.pack(side="left")
+
+        del_btn = tk.Label(
+            chip, text="×", font=FONT_BODY,
+            bg=COLORS["card"], fg=COLORS["text_dim"],
+            cursor="hand2", padx=3
+        )
+        del_btn.pack(side="left")
+        del_btn.bind("<Button-1>", lambda e, a=dict(att): self._delete_attachment(a))
+        del_btn.bind("<Enter>", lambda e: del_btn.config(fg=COLORS["accent"]))
+        del_btn.bind("<Leave>", lambda e: del_btn.config(fg=COLORS["text_dim"]))
+
+        _make_tooltip(chip, path)
+        _make_tooltip(label_lbl, path)
+
+        # Click on chip (outside buttons) opens the file
+        for w in [label_lbl, chip]:
+            w.bind("<Button-1>", lambda e, p=path: _open_path(p, "file"))
+
+        def on_enter(e, c=chip): _set_bg(c, COLORS["card_hover"])
+        def on_leave(e, c=chip): _set_bg(c, COLORS["card"])
+        chip.bind("<Enter>", on_enter)
+        chip.bind("<Leave>", on_leave)
+
+    def _attachments_dir(self) -> str:
+        """Returns attachments folder of this task. A folder which the task already
+        uses is kept, also when the task title was changed in the meantime."""
+        for att in get_attachments(self.task_id, include_deleted=True):
+            folder = os.path.dirname(resolve_attachment_path(att["stored_path"]))
+            if os.path.basename(folder) == "deleted":
+                folder = os.path.dirname(folder)
+            return folder
+        return get_attachment_dir(self.task_id, self.task["title"])
+
+    def _add_attachment(self):
+        paths = filedialog.askopenfilenames(title="Select Files to Attach", parent=self.window)
+        if not paths:
+            return
+
+        task_dir = self._attachments_dir()
+        os.makedirs(task_dir, exist_ok=True)
+
+        for src_path in paths:
+            filename  = os.path.basename(src_path)
+            dest_path = os.path.join(task_dir, filename)
+
+            # If a file with the same name already exists — add a time suffix
+            if os.path.exists(dest_path):
+                base, ext = os.path.splitext(filename)
+                filename  = f"{base}_{datetime.now().strftime('%H%M%S')}{ext}"
+                dest_path = os.path.join(task_dir, filename)
+
+            try:
+                shutil.copy2(src_path, dest_path)
+                create_attachment(self.task_id, filename, dest_path)
+            except Exception as ex:
+                messagebox.showerror(
+                    "Error",
+                    f"Failed to attach the file:\n{src_path}\n\n{ex}",
+                    parent=self.window
+                )
+
+        self._load_attachments()
+
+    def _delete_attachment(self, att: dict):
+        if not messagebox.askyesno(
+            "Delete Attachment",
+            f"Delete attachment?\n\n{att['filename']}\n\n"
+            "The file will be moved to the 'deleted' folder — "
+            "you can manually recover it from there.",
+            parent=self.window
+        ):
+            return
+
+        src = resolve_attachment_path(att["stored_path"])
+        deleted_dir = os.path.join(os.path.dirname(src), "deleted")
+        dest = os.path.join(deleted_dir, os.path.basename(src))
+
+        try:
+            os.makedirs(deleted_dir, exist_ok=True)
+            if os.path.exists(dest):
+                base, ext = os.path.splitext(os.path.basename(src))
+                dest = os.path.join(
+                    deleted_dir, f"{base}_{datetime.now().strftime('%H%M%S')}{ext}")
+            if os.path.exists(src):
+                os.rename(src, dest)
+            soft_delete_attachment(att["id"], dest)
+        except Exception as ex:
+            messagebox.showerror(
+                "Error",
+                f"Failed to delete attachment:\n{ex}",
+                parent=self.window
+            )
+            return
+
+        self._load_attachments()
+
+    # -----------------------------------------------------------------------
+    # Loading Everything / closing
     # -----------------------------------------------------------------------
 
     def _load_all(self):
         self._load_kanban()
         self._load_notes()
         self._load_links()
+        self._load_attachments()
 
-    def _on_close(self):
+    def _note_editors(self) -> list:
+        """Returns note editor windows which are open now."""
+        self._open_note_windows = {nid: ed for nid, ed in self._open_note_windows.items()
+                                   if _editor_alive(ed)}
+        return list(self._open_note_windows.values())
+
+    def rebuild(self):
+        """Builds content of the window again with colors of the active theme.
+        The window and note editors opened from it stay open."""
+        for w in self.window.winfo_children():
+            if not isinstance(w, tk.Toplevel):
+                w.destroy()
+        self.window.configure(bg=COLORS["bg"])
+        self._build_ui()
+        self._load_all()
+        for editor in self._note_editors():
+            editor.rebuild()
+
+    def reload(self):
+        """Reads the task again after the database content was replaced.
+        The window is closed if the task does not exist anymore."""
+        self.task = get_task(self.task_id)
+        if not self.task:
+            self.window.destroy()
+            return
+        existing = {n["id"] for n in get_notes(self.task_id)}
+        for editor in self._note_editors():
+            if editor.note["id"] not in existing:
+                editor.window.destroy()
+        self.rebuild()
+
+    def save_open_notes(self):
+        """Saves unsaved changes of all notes opened from this window."""
+        for editor in self._note_editors():
+            editor.save_if_changed()
+
+    def close(self):
+        """Closes the window. Notes are never lost — unsaved changes are saved first."""
+        self.save_open_notes()
         if self.on_close:
             self.on_close()
         self.window.destroy()
@@ -1055,32 +1257,69 @@ class NoteEditorWindow:
         self._render_preview()
 
     def _on_close(self):
-        if self._edit_mode:
-            current = self.editor_text.get("1.0", "end-1c")
-            saved   = self.note.get("content") or ""
-            if current != saved:
-                answer = messagebox.askyesnocancel(
-                    "Unsaved Changes",
-                    "You have unsaved changes in the note.\n\nDo you want to save them?",
-                    parent=self.window
-                )
-                if answer is None:
-                    return
-                elif answer:
-                    self._save()
+        if self.has_unsaved_changes():
+            answer = messagebox.askyesnocancel(
+                "Unsaved Changes",
+                "You have unsaved changes in the note.\n\nDo you want to save them?",
+                parent=self.window
+            )
+            if answer is None:
+                return
+            elif answer:
+                self._save()
         if self.on_close:
             self.on_close()
         self.window.destroy()
+
+    def has_unsaved_changes(self) -> bool:
+        if not self._edit_mode:
+            return False
+        return self.editor_text.get("1.0", "end-1c") != (self.note.get("content") or "")
+
+    def save_if_changed(self):
+        """Saves the note if it has unsaved changes — used when the window is closed
+        from outside (task window or application closed)."""
+        if self.has_unsaved_changes():
+            self._save()
+
+    def set_title(self, title: str):
+        """Shows new title of the note in the window."""
+        self.note["title"] = title
+        self.window.title(title)
+        self.title_label.config(text=title)
+
+    def rebuild(self):
+        """Builds content of the window again with colors of the active theme.
+        Text which is being edited and the cursor position are kept."""
+        editing = self._edit_mode
+        if editing:
+            text   = self.editor_text.get("1.0", "end-1c")
+            cursor = self.editor_text.index("insert")
+
+        for w in self.window.winfo_children():
+            if not isinstance(w, tk.Toplevel):
+                w.destroy()
+        self.window.configure(bg=COLORS["bg"])
+        self._edit_mode = False
+        self._build_ui()
+        self._render_preview()
+
+        if editing:
+            self._enter_edit_mode()
+            self.editor_text.delete("1.0", "end")
+            self.editor_text.insert("1.0", text)
+            self.editor_text.mark_set("insert", cursor)
 
     def _build_ui(self):
         hdr = tk.Frame(self.window, bg=COLORS["panel"])
         hdr.pack(fill="x")
 
-        tk.Label(
+        self.title_label = tk.Label(
             hdr, text=self.note["title"],
             font=FONT_HEADING, bg=COLORS["panel"],
             fg=COLORS["accent"], padx=16, pady=10
-        ).pack(side="left")
+        )
+        self.title_label.pack(side="left")
 
         dt = self.note["created_at"][:16].replace("T", "  ")
         tk.Label(
@@ -1462,30 +1701,11 @@ def _note_preview(content: str, max_lines: int = 2, max_chars: int = 78) -> str:
         preview.append(line)
     return '\n'.join(preview)
 
-def _setup_mousewheel_scroll(canvas):
-    """Binds mouse wheel scrolling to the canvas only when the cursor is over it."""
-    def _scroll(event):
-        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-    def _bind():
-        canvas.bind_all("<MouseWheel>", _scroll)
-
-    def _check_and_unbind():
-        try:
-            if not canvas.winfo_exists():
-                return
-            cx, cy = canvas.winfo_rootx(), canvas.winfo_rooty()
-            cw, ch = canvas.winfo_width(), canvas.winfo_height()
-            px, py = canvas.winfo_pointerx(), canvas.winfo_pointery()
-            if cx <= px <= cx + cw and cy <= py <= cy + ch:
-                _bind()
-            else:
-                canvas.unbind_all("<MouseWheel>")
-        except Exception:
-            pass
-
-    canvas.bind("<Enter>", lambda e: _bind())
-    canvas.bind("<Leave>", lambda e: canvas.after(10, _check_and_unbind))
+def _editor_alive(editor) -> bool:
+    try:
+        return bool(editor.window.winfo_exists())
+    except Exception:
+        return False
 
 
 def _set_bg(widget, color: str):

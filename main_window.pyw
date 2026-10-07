@@ -2,16 +2,17 @@
 
 import os
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox
 from database import (
-    init_db, backup_db,
+    init_db, backup_db, verify_db,
     get_all_tasks, get_on_hold_tasks,
     create_task, set_on_hold, get_task_progress,
     get_task_checkpoint_status, get_last_activity
 )
-from config import APP_TITLE, MAIN_WINDOW_SIZE, STATUS_COLORS, CHECKPOINTS
+from config import (APP_TITLE, MAIN_WINDOW_SIZE, STATUS_COLORS, CHECKPOINTS,
+                    DEFAULT_CHECKPOINT, DB_PATH, DB_CHECK_INTERVAL_MS)
 from archive import export_task_to_zip, import_task_from_zip, list_archive, remove_archived_task
-from backup import create_backup, list_backups, delete_backup
+from backup import create_backup, list_backups, delete_backup, restore_backup
 from theme import load_theme, get_colors, SettingsDialog
 
 # Load theme on module import
@@ -32,34 +33,58 @@ SORT_OPTIONS = [
     ("Title A–Z",         "title"),
 ]
 
+# Refresh interval of the tasks list in ms
+AUTO_REFRESH_MS = 5000
+
 
 # ---------------------------------------------------------------------------
-# Helper: scroll with a mouse wheel only when the cursor is over the canvas
+# Helper: mouse wheel scrolling
 # ---------------------------------------------------------------------------
 
-def _setup_mousewheel_scroll(canvas):
+def _enable_mousewheel_scroll(root):
+    """One mouse wheel handler for the whole application.
+    The wheel scrolls the list which is under the cursor — in any window of the
+    application, also in one which is in the background. A window covered by
+    another one is not under the cursor, so it is never scrolled."""
     def _scroll(event):
-        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-    def _bind():
-        canvas.bind_all("<MouseWheel>", _scroll)
-
-    def _check_and_unbind():
         try:
-            if not canvas.winfo_exists():
-                return
-            cx, cy = canvas.winfo_rootx(), canvas.winfo_rooty()
-            cw, ch = canvas.winfo_width(), canvas.winfo_height()
-            px, py = canvas.winfo_pointerx(), canvas.winfo_pointery()
-            if cx <= px <= cx + cw and cy <= py <= cy + ch:
-                _bind()
-            else:
-                canvas.unbind_all("<MouseWheel>")
+            widget = root.winfo_containing(event.x_root, event.y_root)
         except Exception:
-            pass
+            return
+        steps = int(-1 * (event.delta / 120))
+        if steps == 0:
+            steps = -1 if event.delta > 0 else 1
 
-    canvas.bind("<Enter>", lambda e: _bind())
-    canvas.bind("<Leave>", lambda e: canvas.after(10, _check_and_unbind))
+        while widget is not None:
+            if isinstance(widget, tk.Text):
+                # Text widget scrolls itself when the event is addressed to it
+                if widget is not event.widget:
+                    widget.yview_scroll(steps, "units")
+                return
+            if isinstance(widget, tk.Canvas):
+                # Nothing to scroll when the whole content is visible
+                if widget.yview() != (0.0, 1.0):
+                    widget.yview_scroll(steps, "units")
+                return
+            widget = widget.master
+
+    root.bind_all("<MouseWheel>", _scroll)
+
+
+def _rebuild_window(win):
+    """Builds content of a window again, with colors of the active theme.
+    The window itself stays open."""
+    for w in win.window.winfo_children():
+        w.destroy()
+    win.window.configure(bg=COLORS["bg"])
+    win._build_ui()
+
+
+def _window_alive(win) -> bool:
+    try:
+        return bool(win.window.winfo_exists())
+    except Exception:
+        return False
 
 
 class MainWindow:
@@ -71,18 +96,42 @@ class MainWindow:
         self.root.minsize(700, 450)
 
         self._task_windows = {}   # task_id -> TaskWindow
+        self._aux_windows  = []   # On Hold / Archive / Backup windows
+        self._cards        = {}   # task_id -> widgets and state of the task card
+        self._card_order   = []   # task ids in the order of cards on the list
+        self._db_error_shown = False
+
+        # Check the database before anything is read from it
+        db_status = verify_db()
+        if db_status == "failed":
+            messagebox.showerror(
+                "Database Error",
+                "The database is damaged and there is no working copy to restore it from.\n\n"
+                f"{DB_PATH}\n\n"
+                "The application will be closed.",
+                parent=root
+            )
+            root.after(100, root.destroy)
+            return
+
         init_db()
         backup_db()
+        _enable_mousewheel_scroll(self.root)
         self._build_ui()
         self._load_tasks()
         self._start_auto_refresh()
+        self.root.after(DB_CHECK_INTERVAL_MS, self._check_db)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_app_close)
+
+        if db_status == "restored":
+            self.root.after(300, self._show_db_restored)
 
     def _build_ui(self):
         header = tk.Frame(self.root, bg=COLORS["panel"])
         header.pack(fill="x", side="top")
 
         tk.Label(
-            header, text="◈  TASK DASHBOARD",
+            header, text=f"◈  {APP_TITLE.upper()}",
             font=FONT_TITLE, bg=COLORS["panel"],
             fg=COLORS["accent"], padx=20, pady=14
         ).pack(side="left")
@@ -118,17 +167,16 @@ class MainWindow:
         tk.Label(filter_bar, text="Sort by:", font=FONT_BODY,
                  bg=COLORS["bg"], fg=COLORS["text_dim"]).pack(side="left")
 
-        self.sort_var = tk.StringVar(value="last_activity")
+        self.sort_var = tk.StringVar(value=SORT_OPTIONS[0][0])
         sort_cb = ttk.Combobox(
             filter_bar, textvariable=self.sort_var,
             values=[opt[0] for opt in SORT_OPTIONS],
             state="readonly", width=18, font=FONT_BODY
         )
-        sort_cb.set(SORT_OPTIONS[0][0])
         sort_cb.pack(side="left", padx=(6, 0), ipady=2)
         sort_cb.bind("<<ComboboxSelected>>", lambda e: self._load_tasks())
 
-        # Combobox style for dark theme
+        # Combobox style for the active theme
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("TCombobox",
@@ -160,7 +208,6 @@ class MainWindow:
         )
         self.canvas.bind("<Configure>", self._on_canvas_resize)
         self.cards_frame.bind("<Configure>", self._on_frame_configure)
-        _setup_mousewheel_scroll(self.canvas)
 
     # -----------------------------------------------------------------------
     # Loading tasks
@@ -173,9 +220,20 @@ class MainWindow:
                 return opt_key
         return "last_activity"
 
-    def _load_tasks(self):
-        query    = self.search_var.get().lower() if hasattr(self, "search_var") else ""
-        sort_key = self._get_sort_key() if hasattr(self, "sort_var") else "last_activity"
+    def _get_task_state(self, task: dict) -> dict:
+        """Returns everything what is shown on the task card besides the task record itself."""
+        done, total = get_task_progress(task["id"])
+        return {
+            "done":          done,
+            "total":         total,
+            "status":        get_task_checkpoint_status(task["id"]),
+            "last_activity": get_last_activity(task["id"]),
+        }
+
+    def _get_sorted_tasks(self) -> list:
+        """Returns list of (task, state) filtered and sorted according to the filter bar."""
+        query    = self.search_var.get().lower()
+        sort_key = self._get_sort_key()
 
         tasks = get_all_tasks()   # default: created_at DESC
 
@@ -183,24 +241,33 @@ class MainWindow:
             tasks = [t for t in tasks if query in t["title"].lower()
                      or query in (t["description"] or "").lower()]
 
-        if sort_key == "last_activity":
-            tasks.sort(key=lambda t: get_last_activity(t["id"]), reverse=True)
-        elif sort_key == "created_at":
-            tasks.sort(key=lambda t: t["created_at"], reverse=True)
-        elif sort_key == "progress":
-            def _prog(t):
-                done, total = get_task_progress(t["id"])
-                return done / total if total else 0.0
-            tasks.sort(key=_prog, reverse=True)
-        elif sort_key == "title":
-            tasks.sort(key=lambda t: t["title"].lower())
+        items = [(t, self._get_task_state(t)) for t in tasks]
 
+        if sort_key == "last_activity":
+            items.sort(key=lambda i: i[1]["last_activity"], reverse=True)
+        elif sort_key == "created_at":
+            items.sort(key=lambda i: i[0]["created_at"], reverse=True)
+        elif sort_key == "progress":
+            items.sort(key=lambda i: i[1]["done"] / i[1]["total"] if i[1]["total"] else 0.0,
+                       reverse=True)
+        elif sort_key == "title":
+            items.sort(key=lambda i: i[0]["title"].lower())
+
+        return items
+
+    def _load_tasks(self):
+        """Builds the whole list of task cards from scratch."""
+        self._build_cards(self._get_sorted_tasks())
+
+    def _build_cards(self, items: list):
         for w in self.cards_frame.winfo_children():
             w.destroy()
+        self._cards = {}
+        self._card_order = [task["id"] for task, _ in items]
 
-        self.count_label.config(text=f"{len(tasks)} task{'s' if len(tasks) != 1 else ''}")
+        self.count_label.config(text=f"{len(items)} task{'s' if len(items) != 1 else ''}")
 
-        if not tasks:
+        if not items:
             tk.Label(
                 self.cards_frame,
                 text="No tasks available. Click '+ New task' to add the first one.",
@@ -208,25 +275,46 @@ class MainWindow:
             ).pack()
             return
 
-        for task in tasks:
-            self._make_task_card(task)
+        for task, state in items:
+            self._make_task_card(task, state)
 
-    def _make_task_card(self, task: dict):
-        done, total  = get_task_progress(task["id"])
-        progress_pct = done / total if total else 0
-        is_finished  = (done == total and total > 0)
+    def _refresh_tasks(self):
+        """Refreshes the list without rebuilding it. Cards are built again only when
+        the set of tasks, their order, title or description changed; otherwise only
+        the changed values are updated in the existing cards, so nothing blinks."""
+        items = self._get_sorted_tasks()
 
-        if done == 0:
-            status_color = STATUS_COLORS["not_started"]
-        elif is_finished:
-            status_color = STATUS_COLORS["completed"]
-        else:
-            status_color = STATUS_COLORS["in_progress"]
+        if [task["id"] for task, _ in items] != self._card_order:
+            self._build_cards(items)
+            return
 
+        for task, state in items:
+            card = self._cards[task["id"]]
+            if (task["title"], task["description"]) != (card["title"], card["description"]):
+                self._build_cards(items)
+                return
+            if state != card["state"]:
+                self._update_task_card(task, state)
+
+    @staticmethod
+    def _status_color(state: dict) -> str:
+        if state["done"] == 0:
+            return STATUS_COLORS["not_started"]
+        if state["done"] == state["total"]:
+            return STATUS_COLORS["completed"]
+        return STATUS_COLORS["in_progress"]
+
+    @staticmethod
+    def _activity_text(state: dict) -> str:
+        last_act = state["last_activity"]
+        return "last activity: " + (last_act[:16].replace("T", "  ") if last_act else "")
+
+    def _make_task_card(self, task: dict, state: dict):
         card = tk.Frame(self.cards_frame, bg=COLORS["card"], pady=12, padx=14)
         card.pack(fill="x", pady=4, padx=2)
 
-        tk.Frame(card, bg=status_color, width=4).pack(side="left", fill="y", padx=(0, 12))
+        status_bar = tk.Frame(card, bg=self._status_color(state), width=4)
+        status_bar.pack(side="left", fill="y", padx=(0, 12))
 
         info = tk.Frame(card, bg=COLORS["card"])
         info.pack(side="left", fill="both", expand=True)
@@ -248,23 +336,20 @@ class MainWindow:
         progress_frame = tk.Frame(info, bg=COLORS["progress_bg"], height=4)
         progress_frame.pack(fill="x", pady=(4, 2))
         progress_frame.pack_propagate(False)
-        if progress_pct > 0:
-            tk.Frame(progress_frame, bg=COLORS["progress_fg"]).place(
-                relwidth=progress_pct, relheight=1.0)
+        progress_fill = tk.Frame(progress_frame, bg=COLORS["progress_fg"])
 
         bottom_row = tk.Frame(info, bg=COLORS["card"])
         bottom_row.pack(fill="x", pady=(2, 0))
 
-        checkpoint_status = get_task_checkpoint_status(task["id"])
-        tk.Label(bottom_row, text=checkpoint_status,
-                 font=("Segoe UI", 8, "bold"), bg=COLORS["card"],
-                 fg=COLORS["accent2"], anchor="w").pack(side="left")
+        status_label = tk.Label(bottom_row, text="",
+                                font=("Segoe UI", 8, "bold"), bg=COLORS["card"],
+                                fg=COLORS["accent2"], anchor="w")
+        status_label.pack(side="left")
 
-        last_act = get_last_activity(task["id"])
-        last_act_str = last_act[:16].replace("T", "  ") if last_act else ""
-        tk.Label(bottom_row, text=f"last activity: {last_act_str}",
-                 font=FONT_SMALL, bg=COLORS["card"],
-                 fg=COLORS["text_dim"], anchor="e").pack(side="right")
+        activity_label = tk.Label(bottom_row, text="",
+                                  font=FONT_SMALL, bg=COLORS["card"],
+                                  fg=COLORS["text_dim"], anchor="e")
+        activity_label.pack(side="right")
 
         actions = tk.Frame(card, bg=COLORS["card"])
         actions.pack(side="right", padx=(12, 0))
@@ -274,12 +359,6 @@ class MainWindow:
             lambda tid=task["id"]: self._hold_task(tid),
             small=True, secondary=True, side="top", padx=2, pady=2
         )
-        if is_finished:
-            self._make_button(
-                actions, "📦 Archive",
-                lambda tid=task["id"], ttl=task["title"]: self._archive_task(tid, ttl, "active"),
-                small=True, secondary=True, side="top", padx=2, pady=2
-            )
 
         def open_on_click(e, tid=task["id"]):
             self._open_task(tid)
@@ -295,8 +374,50 @@ class MainWindow:
             except Exception:
                 pass
 
-        self._bind_hover(card, COLORS["card"], COLORS["card_hover"], deep=True,
-                         exclude=actions)
+        self._bind_hover(card, COLORS["card"], COLORS["card_hover"],
+                         exclude=[status_bar, progress_frame, actions])
+
+        # References to the parts of the card which change — used by _update_task_card
+        self._cards[task["id"]] = {
+            "title":          task["title"],
+            "description":    task["description"],
+            "state":          None,
+            "status_bar":     status_bar,
+            "progress_fill":  progress_fill,
+            "status_label":   status_label,
+            "activity_label": activity_label,
+            "actions":        actions,
+            "archive_btn":    None,
+        }
+        self._update_task_card(task, state)
+
+    def _update_task_card(self, task: dict, state: dict):
+        """Puts current values into an existing task card."""
+        card = self._cards[task["id"]]
+        is_finished = (state["done"] == state["total"] and state["total"] > 0)
+
+        card["status_bar"].config(bg=self._status_color(state))
+
+        if state["done"] > 0 and state["total"]:
+            card["progress_fill"].place(relwidth=state["done"] / state["total"], relheight=1.0)
+        else:
+            card["progress_fill"].place_forget()
+
+        card["status_label"].config(text=state["status"])
+        card["activity_label"].config(text=self._activity_text(state))
+
+        # Archive button is available only for a finished task
+        if is_finished and card["archive_btn"] is None:
+            card["archive_btn"] = self._make_button(
+                card["actions"], "📦 Archive",
+                lambda tid=task["id"], ttl=task["title"]: self._archive_task(tid, ttl, "active"),
+                small=True, secondary=True, side="top", padx=2, pady=2
+            )
+        elif not is_finished and card["archive_btn"] is not None:
+            card["archive_btn"].destroy()
+            card["archive_btn"] = None
+
+        card["state"] = state
 
     # -----------------------------------------------------------------------
     # Actions
@@ -314,23 +435,27 @@ class MainWindow:
         from task_window import TaskWindow
 
         # If the task is already open — give it focus
-        if task_id in self._task_windows:
-            try:
-                tw = self._task_windows[task_id]
-                if tw.window.winfo_exists():
-                    tw.window.lift()
-                    tw.window.focus_force()
-                    return
-            except Exception:
-                pass
+        tw = self._task_windows.get(task_id)
+        if tw is not None:
+            if _window_alive(tw):
+                tw.window.lift()
+                tw.window.focus_force()
+                return
             del self._task_windows[task_id]
 
         def on_task_close(tid=task_id):
             self._task_windows.pop(tid, None)
-            self._load_tasks()
+            self._refresh_tasks()
 
         tw = TaskWindow(self.root, task_id, on_close=on_task_close)
-        self._task_windows[task_id] = tw
+        if _window_alive(tw):
+            self._task_windows[task_id] = tw
+
+    def _close_task_window(self, task_id: int):
+        """Closes window of the task if it is open. Unsaved notes are saved first."""
+        tw = self._task_windows.pop(task_id, None)
+        if tw is not None and _window_alive(tw):
+            tw.close()
 
     def _hold_task(self, task_id: int):
         set_on_hold(task_id, True)
@@ -340,11 +465,12 @@ class MainWindow:
         if not messagebox.askyesno(
             "Archive Task",
             f"Are you sure you want to archive the task:\n\n\"{title}\"\n\n"
-           f"The task will be removed from the database and saved as a ZIP file in the archive folder.",
+            f"The task will be removed from the database and saved as a ZIP file in the archive folder.",
             parent=self.root
         ):
             return
         try:
+            self._close_task_window(task_id)
             zip_path = export_task_to_zip(task_id, source)
             self._load_tasks()
             messagebox.showinfo(
@@ -356,49 +482,110 @@ class MainWindow:
             messagebox.showerror("Error", f"Failed to archive task:\n{e}", parent=self.root)
 
     def _open_backup(self):
-        BackupWindow(self.root)
+        self._aux_windows.append(BackupWindow(self.root, on_restore=self._load_tasks))
 
     def _open_settings(self):
-        def on_theme_change():
-            # Close all open task windows before rebuilding UI
-            for tw in list(self._task_windows.values()):
-                try:
-                    if tw.window.winfo_exists():
-                        tw.window.destroy()
-                except Exception:
-                    pass
-            self._task_windows.clear()
+        SettingsDialog(self.root, on_theme_change=self._apply_theme)
 
-            # Destroy and rebuild whole UI of the main window
-            for w in self.root.winfo_children():
+    def _apply_theme(self):
+        """Builds content of all open windows again with colors of the new theme.
+        No window is closed and nothing typed in is lost."""
+        search, sort_label = self.search_var.get(), self.sort_var.get()
+
+        for w in self.root.winfo_children():
+            if not isinstance(w, tk.Toplevel):
                 w.destroy()
+        self.root.configure(bg=COLORS["bg"])
+        self._build_ui()
+        self.sort_var.set(sort_label)
+        self.search_var.set(search)   # loads the list of tasks as well
 
-            self.root.configure(bg=COLORS["bg"])
-            self._build_ui()
-            self._load_tasks()
+        for tw in list(self._task_windows.values()):
+            if _window_alive(tw):
+                tw.rebuild()
 
-        SettingsDialog(self.root, on_theme_change=on_theme_change)
+        self._aux_windows = [w for w in self._aux_windows if _window_alive(w)]
+        for win in self._aux_windows:
+            _rebuild_window(win)
 
     def _open_on_hold(self):
-        OnHoldWindow(self.root, on_restore=self._load_tasks, on_archive=self._load_tasks)
+        self._aux_windows.append(OnHoldWindow(
+            self.root, on_restore=self._load_tasks, on_archive=self._load_tasks,
+            before_archive=self._close_task_window))
 
     def _open_archive(self):
-        ArchiveWindow(self.root, on_restore=self._load_tasks)
+        self._aux_windows.append(ArchiveWindow(self.root, on_restore=self._load_tasks))
 
     def _start_auto_refresh(self):
+        # Next refresh is planned first — an error below does not stop refreshing
+        self.root.after(AUTO_REFRESH_MS, self._start_auto_refresh)
+
         # Clear expired references
-        dead = [tid for tid, tw in self._task_windows.items()
-                if not self._window_alive(tw)]
+        dead = [tid for tid, tw in self._task_windows.items() if not _window_alive(tw)]
         for tid in dead:
             del self._task_windows[tid]
-        self._load_tasks()
-        self.root.after(5000, self._start_auto_refresh)
+        self._aux_windows = [w for w in self._aux_windows if _window_alive(w)]
 
-    def _window_alive(self, tw) -> bool:
-        try:
-            return tw.window.winfo_exists()
-        except Exception:
-            return False
+        self._refresh_tasks()
+
+    # -----------------------------------------------------------------------
+    # Database check
+    # -----------------------------------------------------------------------
+
+    def _check_db(self):
+        """Periodic check of the database. A database which is fine is saved as the
+        last working copy; a damaged one is restored from that copy."""
+        self.root.after(DB_CHECK_INTERVAL_MS, self._check_db)
+
+        db_status = verify_db()
+        if db_status == "ok":
+            backup_db()
+            self._db_error_shown = False
+        elif db_status == "restored":
+            init_db()
+            self._reload_after_db_change()
+            self._show_db_restored()
+        elif not self._db_error_shown:
+            self._db_error_shown = True
+            messagebox.showerror(
+                "Database Error",
+                "The database is damaged and there is no working copy to restore it from.\n\n"
+                f"{DB_PATH}",
+                parent=self.root
+            )
+
+    def _show_db_restored(self):
+        messagebox.showwarning(
+            "Database Restored",
+            "The database was damaged and has been restored from the last working copy.\n\n"
+            "Changes made after the last check of the database may be missing.\n"
+            "The damaged file was kept next to the database (tasks.db.corrupt_...).",
+            parent=self.root
+        )
+
+    def _reload_after_db_change(self):
+        """Reloads everything shown after the database content was replaced."""
+        for task_id, tw in list(self._task_windows.items()):
+            if _window_alive(tw):
+                tw.reload()
+            if not _window_alive(tw):
+                self._task_windows.pop(task_id, None)
+        self._load_tasks()
+        self._aux_windows = [w for w in self._aux_windows if _window_alive(w)]
+        for win in self._aux_windows:
+            _rebuild_window(win)
+
+    def _on_app_close(self):
+        """Closing the application: unsaved notes are saved, the database is checked
+        and saved as the last working copy."""
+        for tw in list(self._task_windows.values()):
+            if _window_alive(tw):
+                try:
+                    tw.save_open_notes()
+                except Exception:
+                    pass
+        backup_db()
+        self.root.destroy()
 
     # -----------------------------------------------------------------------
     # UI helpers
@@ -421,22 +608,31 @@ class MainWindow:
         btn.bind("<Leave>", lambda e: btn.config(bg=bg))
         return btn
 
-    def _bind_hover(self, widget, color_normal, color_hover,
-                    deep=False, exclude=None):
+    def _bind_hover(self, widget, color_normal, color_hover, exclude=()):
+        """Changes background of the widget and everything inside it while the cursor
+        is over it. Widgets from exclude (and their content) keep their own colors."""
+        def set_color(w, color):
+            try:
+                w.config(bg=color)
+            except Exception:
+                pass
+            for child in w.winfo_children():
+                if child not in exclude:
+                    set_color(child, color)
+
         def on_enter(e):
-            widget.config(bg=color_hover)
-            if deep:
-                for child in widget.winfo_children():
-                    if child is not exclude:
-                        try: child.config(bg=color_hover)
-                        except Exception: pass
+            set_color(widget, color_hover)
+
         def on_leave(e):
-            widget.config(bg=color_normal)
-            if deep:
-                for child in widget.winfo_children():
-                    if child is not exclude:
-                        try: child.config(bg=color_normal)
-                        except Exception: pass
+            # Moving the cursor onto a child of the widget is not leaving it
+            try:
+                under = str(widget.winfo_containing(*widget.winfo_pointerxy()) or "")
+            except Exception:
+                under = ""
+            if under == str(widget) or under.startswith(str(widget) + "."):
+                return
+            set_color(widget, color_normal)
+
         widget.bind("<Enter>", on_enter)
         widget.bind("<Leave>", on_leave)
 
@@ -499,7 +695,7 @@ class NewTaskDialog:
             variable=self.template_var, value="template", **radio_style
         ).pack(anchor="w")
         tk.Radiobutton(
-            tmpl_frame, text="Empty Kanban",
+            tmpl_frame, text=f"Empty Kanban  (\"{DEFAULT_CHECKPOINT['name']}\" checkpoint only)",
             variable=self.template_var, value="empty", **radio_style
         ).pack(anchor="w")
 
@@ -533,9 +729,10 @@ class NewTaskDialog:
 # ---------------------------------------------------------------------------
 
 class OnHoldWindow:
-    def __init__(self, parent, on_restore=None, on_archive=None):
+    def __init__(self, parent, on_restore=None, on_archive=None, before_archive=None):
         self.on_restore = on_restore
         self.on_archive = on_archive
+        self.before_archive = before_archive   # function(task_id) called before a task is archived
 
         self.window = tk.Toplevel(parent)
         self.window.title("On Hold")
@@ -543,6 +740,9 @@ class OnHoldWindow:
         self.window.geometry("700x480")
         self.window.minsize(500, 300)
 
+        self._build_ui()
+
+    def _build_ui(self):
         header = tk.Frame(self.window, bg=COLORS["panel"])
         header.pack(fill="x")
         tk.Label(header, text="⏸  ON HOLD", font=FONT_TITLE,
@@ -564,7 +764,6 @@ class OnHoldWindow:
         self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(cw, width=e.width))
         self.cards_frame.bind("<Configure>",
             lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        _setup_mousewheel_scroll(self.canvas)
 
         self._load()
 
@@ -601,7 +800,7 @@ class OnHoldWindow:
         tk.Label(row1, text=f"on hold: {hold_date}", font=FONT_SMALL,
                  bg=COLORS["card"], fg=COLORS["text_dim"]).pack(side="right")
 
-        tk.Label(info, text=f"{done} from {total} checkpoints completed", font=FONT_SMALL,
+        tk.Label(info, text=f"{done} of {total} checkpoints completed", font=FONT_SMALL,
                  bg=COLORS["card"], fg=COLORS["text_dim"], anchor="w").pack(anchor="w", pady=(2, 0))
 
         actions = tk.Frame(card, bg=COLORS["card"])
@@ -631,11 +830,13 @@ class OnHoldWindow:
         if not messagebox.askyesno(
             "Archive Task",
             f"Are you sure you want to archive the task:\n\n\"{title}\"\n\n"
-           f"The task will be deleted from the database and saved as a ZIP file.",
+            f"The task will be deleted from the database and saved as a ZIP file.",
             parent=self.window
         ):
             return
         try:
+            if self.before_archive:
+                self.before_archive(task_id)
             zip_path = export_task_to_zip(task_id, "onhold")
             if self.on_archive:
                 self.on_archive()
@@ -653,13 +854,18 @@ class OnHoldWindow:
 # ---------------------------------------------------------------------------
 
 class BackupWindow:
-    def __init__(self, parent):
-        self.window = tk.Toplevel(parent)
-        self.window.title("Dashboard Backup")
-        self.window.configure(bg=COLORS["bg"])
-        self.window.geometry("680x500")
-        self.window.minsize(520, 360)
+    def __init__(self, parent, on_restore=None):
+        self.on_restore = on_restore
 
+        self.window = tk.Toplevel(parent)
+        self.window.title("Backup")
+        self.window.configure(bg=COLORS["bg"])
+        self.window.geometry("720x500")
+        self.window.minsize(560, 360)
+
+        self._build_ui()
+
+    def _build_ui(self):
         header = tk.Frame(self.window, bg=COLORS["panel"])
         header.pack(fill="x")
         tk.Label(header, text="💾  BACKUP", font=FONT_TITLE,
@@ -702,7 +908,6 @@ class BackupWindow:
         self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(cw, width=e.width))
         self.cards_frame.bind("<Configure>",
             lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        _setup_mousewheel_scroll(self.canvas)
 
         self._load()
 
@@ -749,6 +954,7 @@ class BackupWindow:
                 f"Tasks: {meta.get('tasks_active', '?')} active, "
                 f"{meta.get('tasks_on_hold', '?')} on hold, "
                 f"{meta.get('tasks_archived', '?')} archived  |  "
+                f"Attachments: {meta.get('attachment_files', 0)} files  |  "
                 f"Packed: {meta.get('packed_files', '?')} files"
             )
         else:
@@ -763,6 +969,15 @@ class BackupWindow:
         # Buttons
         actions = tk.Frame(card, bg=COLORS["card"])
         actions.pack(side="right", padx=(12, 0))
+
+        restore_btn = tk.Label(actions, text="↩ Restore", font=FONT_SMALL,
+                               bg=COLORS["btn"], fg="white",
+                               padx=8, pady=4, cursor="hand2")
+        restore_btn.pack(pady=(0, 4))
+        restore_btn.bind("<Button-1>",
+            lambda e, p=b["zip_path"], fn=b["filename"]: self._restore(p, fn))
+        restore_btn.bind("<Enter>", lambda e: restore_btn.config(bg=COLORS["btn_hover"]))
+        restore_btn.bind("<Leave>", lambda e: restore_btn.config(bg=COLORS["btn"]))
 
         open_btn = tk.Label(actions, text="📂 Open folder", font=FONT_SMALL,
                             bg=COLORS["btn_secondary"], fg=COLORS["text_dim"],
@@ -818,6 +1033,33 @@ class BackupWindow:
             btn.config(text="+ Create backup", bg=COLORS["btn"], cursor="hand2")
             btn.bind("<Button-1>", lambda e: self._create_backup(btn))
 
+    def _restore(self, zip_path: str, filename: str):
+        if not messagebox.askyesno(
+            "Restore Backup",
+            f"Restore data from the backup?\n\n{filename}\n\n"
+            "Tasks and archived tasks which are missing now will be added from the backup.\n"
+            "Existing tasks will not be changed or removed.",
+            parent=self.window
+        ):
+            return
+        try:
+            result = restore_backup(zip_path)
+            if self.on_restore:
+                self.on_restore()
+            messagebox.showinfo(
+                "Backup Restored",
+                f"Tasks added: {result['tasks_added']}\n"
+                f"Tasks already existing (skipped): {result['tasks_skipped']}\n"
+                f"Archived tasks added: {result['archives_added']}",
+                parent=self.window
+            )
+        except Exception as ex:
+            messagebox.showerror(
+                "Backup Error",
+                f"Failed to restore backup:\n{ex}",
+                parent=self.window
+            )
+
     def _open_folder(self, zip_path: str):
         """Opens backup folder in Windows Explorer."""
         folder = os.path.dirname(zip_path)
@@ -859,6 +1101,9 @@ class ArchiveWindow:
         self.window.geometry("800x520")
         self.window.minsize(600, 350)
 
+        self._build_ui()
+
+    def _build_ui(self):
         header = tk.Frame(self.window, bg=COLORS["panel"])
         header.pack(fill="x")
         tk.Label(header, text="📦  ARCHIVE", font=FONT_TITLE,
@@ -880,7 +1125,6 @@ class ArchiveWindow:
         self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(cw, width=e.width))
         self.cards_frame.bind("<Configure>",
             lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        _setup_mousewheel_scroll(self.canvas)
 
         self._load()
 
@@ -947,7 +1191,7 @@ class ArchiveWindow:
                                bg=COLORS["btn"], fg="white", padx=8, pady=4, cursor="hand2")
         restore_btn.pack(pady=(0, 2))
         restore_btn.bind("<Button-1>",
-            lambda e, zp=a["zip_path"], fn=a["filename"]: self._restore(zp, fn))
+            lambda e, zp=a["zip_path"], fn=a["filename"], src=a["source"]: self._restore(zp, fn, src))
         restore_btn.bind("<Enter>", lambda e: restore_btn.config(bg=COLORS["btn_hover"]))
         restore_btn.bind("<Leave>", lambda e: restore_btn.config(bg=COLORS["btn"]))
 
@@ -959,8 +1203,8 @@ class ArchiveWindow:
         del_btn.bind("<Enter>", lambda e: del_btn.config(bg="#5a2020"))
         del_btn.bind("<Leave>", lambda e: del_btn.config(bg="#3a1515"))
 
-    def _restore(self, zip_path: str, filename: str):
-        source_label = "On Hold" if "onhold" in filename else "Active"
+    def _restore(self, zip_path: str, filename: str, source: str):
+        source_label = "On Hold" if source == "onhold" else "Active"
         if not messagebox.askyesno(
             "Restore Task",
             f"Restore task to the {source_label} list?\n\n{filename}",
